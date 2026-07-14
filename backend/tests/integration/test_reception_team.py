@@ -482,6 +482,165 @@ async def test_failed_team_node_emits_sanitized_error_and_persists_timestamp(tmp
     await engine.dispose()
 
 
+async def _assert_setup_failure_is_sanitized_and_terminal(
+    sessions, owner_user_id: str, request_id: str, events
+):
+    assert [event.type for event in events] == ["run_started", "error"]
+    assert events[-1].data["code"] == "TEAM_SETUP_FAILED"
+    assert "secret" not in events[-1].model_dump_json().lower()
+    async with sessions() as db:
+        run = await db.scalar(
+            select(TeamRunRow).where(TeamRunRow.request_id == request_id)
+        )
+        nodes = list(
+            await db.scalars(
+                select(TeamNodeRunRow).where(
+                    TeamNodeRunRow.team_run_id == run.id,
+                    TeamNodeRunRow.owner_user_id == owner_user_id,
+                )
+            )
+        )
+    assert run.status == "error" and run.completed_at is not None
+    assert run.result_data == {
+        "error_code": "TEAM_SETUP_FAILED",
+        "agentscope_artifacts": "retained_for_audit",
+    }
+    assert len(nodes) == 3
+    assert all(
+        node.status == "error"
+        and node.completed_at is not None
+        and node.error_code == "TEAM_SETUP_FAILED"
+        for node in nodes
+    )
+
+
+@_async_test
+async def test_team_create_failure_is_sanitized_and_terminal(tmp_path):
+    from app.agents.reception import ReceptionTeamRuntime
+
+    class FailingTeamCreate:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __call__(self, **_kwargs):
+            raise RuntimeError("secret=team-create-key")
+
+    engine, sessions, users = await _runtime_db(tmp_path)
+    owner = users["manager0001"].id
+    events = await _collect(
+        ReceptionTeamRuntime(
+            sessions, team_create_factory=FailingTeamCreate
+        ).chat(
+            owner,
+            "reception-session-1",
+            "team creation failure",
+            request_id="failed-team-create",
+        )
+    )
+    await _assert_setup_failure_is_sanitized_and_terminal(
+        sessions, owner, "failed-team-create", events
+    )
+    await engine.dispose()
+
+
+@_async_test
+async def test_partial_agent_create_failure_is_sanitized_and_terminal(tmp_path):
+    from app.agents.reception import ReceptionTeamRuntime
+    from app.agentscope_ext.team_tools import AgentCreate
+
+    class PartiallyFailingAgentCreate:
+        def __init__(self, **kwargs):
+            self._delegate = AgentCreate(**kwargs)
+            self._calls = 0
+
+        async def __call__(self, **kwargs):
+            self._calls += 1
+            if self._calls == 2:
+                raise RuntimeError("secret=partial-agent-key")
+            return await self._delegate(**kwargs)
+
+    engine, sessions, users = await _runtime_db(tmp_path)
+    owner = users["manager0001"].id
+    events = await _collect(
+        ReceptionTeamRuntime(
+            sessions, agent_create_factory=PartiallyFailingAgentCreate
+        ).chat(
+            owner,
+            "reception-session-1",
+            "partial agent failure",
+            request_id="failed-partial-agent-create",
+        )
+    )
+    await _assert_setup_failure_is_sanitized_and_terminal(
+        sessions, owner, "failed-partial-agent-create", events
+    )
+    storage = SQLiteStorage(sessions)
+    leader = await storage.get_session(
+        owner, "reception-leader", "reception-session-1"
+    )
+    team = await storage.get_team(owner, leader.team_id)
+    assert len(team.data.members) == 1
+    await engine.dispose()
+
+
+@_async_test
+async def test_repeated_cancel_during_setup_failure_finalize_stays_terminal(tmp_path):
+    from app.agents.reception import ReceptionTeamRuntime
+
+    cleanup_entered = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    class FailingTeamCreate:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __call__(self, **_kwargs):
+            raise RuntimeError("secret=cancel-during-failure")
+
+    async def before_finalize():
+        cleanup_entered.set()
+        await cleanup_release.wait()
+
+    engine, sessions, users = await _runtime_db(tmp_path)
+    owner = users["manager0001"].id
+    task = asyncio.create_task(
+        _collect(
+            ReceptionTeamRuntime(
+                sessions,
+                team_create_factory=FailingTeamCreate,
+                before_setup_failure_finalize=before_finalize,
+            ).chat(
+                owner,
+                "reception-session-1",
+                "cancel failure finalize",
+                request_id="cancel-failed-setup",
+            )
+        )
+    )
+    await asyncio.wait_for(cleanup_entered.wait(), timeout=3)
+    task.cancel()
+    task.cancel()
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    async with sessions() as db:
+        run = await db.scalar(
+            select(TeamRunRow).where(
+                TeamRunRow.request_id == "cancel-failed-setup"
+            )
+        )
+        nodes = list(
+            await db.scalars(
+                select(TeamNodeRunRow).where(
+                    TeamNodeRunRow.team_run_id == run.id
+                )
+            )
+        )
+    assert run.status == "error" and run.completed_at is not None
+    assert all(node.status == "error" for node in nodes)
+    await engine.dispose()
+
+
 def test_root_app_injects_reception_templates_by_default(tmp_path, monkeypatch):
     from app.main import create_root_app
 
@@ -563,3 +722,25 @@ def test_alembic_upgrades_task10_schema_with_node_and_hitl_lifecycle_columns(tmp
         column["name"] for column in schema.get_columns("hitl_requests")
     }
     engine.dispose()
+
+
+def test_alembic_upgrade_then_create_schema_on_fresh_empty_database(tmp_path):
+    from app.db.migrations import upgrade_database_url
+
+    database = tmp_path / "fresh-empty.db"
+    sync_url = f"sqlite:///{database}"
+    upgrade_database_url(sync_url)
+    engine = create_engine(sync_url)
+    assert "alembic_version" in inspect(engine).get_table_names()
+    engine.dispose()
+
+    async def create_current_schema():
+        async_engine = build_async_engine(f"sqlite+aiosqlite:///{database}")
+        await create_schema(async_engine)
+        await async_engine.dispose()
+
+    asyncio.run(create_current_schema())
+    schema = inspect(create_engine(sync_url))
+    assert {"team_runs", "team_node_runs", "hitl_requests"} <= set(
+        schema.get_table_names()
+    )

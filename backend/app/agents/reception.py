@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,16 +12,17 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentscope.app import SubAgentTemplate
-from agentscope.app._tool import AgentCreate, TeamCreate
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBus
 from agentscope.app.storage import StorageBase
 
 from app.db.models import HitlRequestRow, Role, SessionRecordRow, TeamNodeRunRow, TeamRunRow, User
 from app.agentscope_ext.sqlite_storage import SQLiteStorage
+from app.agentscope_ext.team_tools import AgentCreate, TeamCreate
 from .sse import StableEvent
 
 
 AgentTool = Callable[[str, str], Awaitable[dict[str, Any]]]
+logger = logging.getLogger(__name__)
 _AGENT_TYPES = ("pickup", "lodging", "dining")
 _TOOL_PATHS = {
     "pickup": ("mock_mcp", "mock_mcp.plan_pickup"),
@@ -91,13 +93,16 @@ async def _await_uncancellable(awaitable) -> None:
 class ReceptionTeamRuntime:
     """Deterministic Phase-1 orchestration over real AgentScope templates."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, pickup_tool: AgentTool | None = None, lodging_tool: AgentTool | None = None, dining_skill: AgentTool | None = None, templates: list[SubAgentTemplate] | None = None, storage: StorageBase | None = None, message_bus: MessageBus | None = None, workspace_manager: Any = None, after_hitl_commit: Callable[[], Awaitable[None]] | None = None, before_cancel_finalize: Callable[[], Awaitable[None]] | None = None) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, pickup_tool: AgentTool | None = None, lodging_tool: AgentTool | None = None, dining_skill: AgentTool | None = None, templates: list[SubAgentTemplate] | None = None, storage: StorageBase | None = None, message_bus: MessageBus | None = None, workspace_manager: Any = None, after_hitl_commit: Callable[[], Awaitable[None]] | None = None, before_cancel_finalize: Callable[[], Awaitable[None]] | None = None, before_setup_failure_finalize: Callable[[], Awaitable[None]] | None = None, team_create_factory: Callable[..., Any] = TeamCreate, agent_create_factory: Callable[..., Any] = AgentCreate) -> None:
         self._sessions = session_factory
         self._storage = storage or SQLiteStorage(session_factory)
         self._message_bus = message_bus or InMemoryMessageBus()
         self._workspace_manager = workspace_manager or object()
         self._after_hitl_commit = after_hitl_commit
         self._before_cancel_finalize = before_cancel_finalize
+        self._before_setup_failure_finalize = before_setup_failure_finalize
+        self._team_create_factory = team_create_factory
+        self._agent_create_factory = agent_create_factory
         self.tool_paths = {
             "pickup": pickup_tool or MockMcpPickupPath(),
             "lodging": lodging_tool or MockLodgingTool(),
@@ -146,7 +151,7 @@ class ReceptionTeamRuntime:
             "agent_id": leader.agent_id,
         }
         if leader.team_id is None:
-            await TeamCreate(**kwargs)(
+            await self._team_create_factory(**kwargs)(
                 name=f"reception-{run_id[:8]}",
                 description="远方客人接待：接站、住宿、餐饮三角色并行协作。",
             )
@@ -155,7 +160,7 @@ class ReceptionTeamRuntime:
             raise RuntimeError("AgentScope TeamCreate did not persist a team")
 
         template_registry = {template.type: template for template in self.templates}
-        creator = AgentCreate(
+        creator = self._agent_create_factory(
             **kwargs,
             sub_agent_templates=template_registry,
         )
@@ -219,14 +224,75 @@ class ReceptionTeamRuntime:
                 await db.execute(update(TeamNodeRunRow).where(TeamNodeRunRow.team_run_id == run_id, TeamNodeRunRow.owner_user_id == owner, TeamNodeRunRow.status == "running").values(status="cancelled", completed_at=now, error_code="RUN_CANCELLED"))
             await db.commit()
 
+    async def _persist_setup_failed(self, owner: str, run_id: str) -> None:
+        """Terminalize custom orchestration state without deleting AgentScope data.
+
+        A partially-created AgentScope team is retained for later audit because
+        deleting it here could remove artifacts shared with a retried session.
+        """
+        if self._before_setup_failure_finalize is not None:
+            await self._before_setup_failure_finalize()
+        now = datetime.now(timezone.utc)
+        async with self._sessions() as db:
+            run_update = await db.execute(
+                update(TeamRunRow)
+                .where(
+                    TeamRunRow.id == run_id,
+                    TeamRunRow.owner_user_id == owner,
+                    TeamRunRow.status == "running",
+                )
+                .values(
+                    status="error",
+                    completed_at=now,
+                    result_data={
+                        "error_code": "TEAM_SETUP_FAILED",
+                        "agentscope_artifacts": "retained_for_audit",
+                    },
+                )
+            )
+            if run_update.rowcount == 1:
+                await db.execute(
+                    update(TeamNodeRunRow)
+                    .where(
+                        TeamNodeRunRow.team_run_id == run_id,
+                        TeamNodeRunRow.owner_user_id == owner,
+                        TeamNodeRunRow.status.in_(("running", "pending")),
+                    )
+                    .values(
+                        status="error",
+                        completed_at=now,
+                        error_code="TEAM_SETUP_FAILED",
+                    )
+                )
+            await db.commit()
+
     async def chat(self, owner_user_id: str, session_id: str, prompt: str, *, request_id: str | None = None) -> AsyncIterator[StableEvent]:
         request_id = request_id or str(uuid4())
         run_id = await self._start_run(owner_user_id, session_id, request_id)
         try:
             yield self._event("run_started", request_id, session_id, run_id, mode="reception_team")
-            agentscope_team = await self._create_agentscope_workers(
-                owner_user_id, session_id, prompt, run_id
-            )
+            try:
+                agentscope_team = await self._create_agentscope_workers(
+                    owner_user_id, session_id, prompt, run_id
+                )
+            except Exception as error:
+                # Never send the provider/storage exception text to the client.
+                logger.error(
+                    "Reception AgentScope setup failed (%s); partial artifacts retained",
+                    type(error).__name__,
+                )
+                await _await_uncancellable(
+                    self._persist_setup_failed(owner_user_id, run_id)
+                )
+                yield self._event(
+                    "error",
+                    request_id,
+                    session_id,
+                    run_id,
+                    code="TEAM_SETUP_FAILED",
+                    message="Reception expert team setup failed",
+                )
+                return
             yield self._event("token", request_id, session_id, run_id, agent_type="leader", text="主管已拆解接站、住宿、餐饮三个并行任务。")
             for agent_type in _AGENT_TYPES:
                 yield self._event("agent_started", request_id, session_id, run_id, agent_type=agent_type)
