@@ -12,6 +12,7 @@ from app.errors import ApiError
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_TTL = timedelta(minutes=30)
+BANK_DEMO_TENANT_ID = "bank_demo"
 _password_hasher = PasswordHasher()
 
 
@@ -28,6 +29,8 @@ def create_access_token(
     expires_delta: timedelta = ACCESS_TOKEN_TTL,
     settings: Settings | None = None,
 ) -> str:
+    if principal.tenant_id != BANK_DEMO_TENANT_ID:
+        raise ValueError("tenant_id must be bank_demo")
     resolved_settings = settings or get_settings()
     claims = {
         "sub": principal.user_id,
@@ -55,6 +58,8 @@ def decode_access_token(
         )
         if set(claims) != {"sub", "role", "tenant_id", "exp"}:
             raise jwt.InvalidTokenError("unexpected claims")
+        if claims["tenant_id"] != BANK_DEMO_TENANT_ID:
+            raise jwt.InvalidTokenError("unexpected tenant")
         return Principal(
             user_id=str(claims["sub"]),
             role=Role(claims["role"]),

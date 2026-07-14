@@ -1,12 +1,16 @@
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import jwt
 import pytest
 from pydantic import SecretStr
 
 from app.auth.models import Principal
-from app.auth.security import create_access_token, decode_access_token
+from app.auth.security import (
+    BANK_DEMO_TENANT_ID,
+    create_access_token,
+    decode_access_token,
+)
 from app.config import Settings
 from app.db.models import Role
 from app.errors import ApiError
@@ -26,7 +30,7 @@ def _settings(jwt_secret: str = "unit-test-jwt-secret-at-least-32-bytes") -> Set
 def test_valid_token_round_trips_only_identity_claims():
     settings = _settings()
     principal = Principal(
-        user_id="user-1", role=Role.MANAGER, tenant_id="tenant-1"
+        user_id="user-1", role=Role.MANAGER, tenant_id=BANK_DEMO_TENANT_ID
     )
 
     token = create_access_token(principal, settings=settings)
@@ -41,7 +45,7 @@ def test_valid_token_round_trips_only_identity_claims():
 def test_forged_token_is_rejected():
     settings = _settings()
     forged = create_access_token(
-        Principal("user-1", Role.MANAGER, "tenant-1"),
+        Principal("user-1", Role.MANAGER, BANK_DEMO_TENANT_ID),
         settings=_settings("different-signing-key-at-least-32-bytes"),
     )
 
@@ -55,7 +59,7 @@ def test_forged_token_is_rejected():
 def test_expired_token_is_rejected():
     settings = _settings()
     token = create_access_token(
-        Principal("user-1", Role.MANAGER, "tenant-1"),
+        Principal("user-1", Role.MANAGER, BANK_DEMO_TENANT_ID),
         expires_delta=timedelta(seconds=-1),
         settings=settings,
     )
@@ -67,11 +71,39 @@ def test_expired_token_is_rejected():
     assert exc_info.value.code == "TOKEN_EXPIRED"
 
 
+def test_token_issuance_rejects_a_non_bank_demo_tenant():
+    with pytest.raises(ValueError, match="bank_demo"):
+        create_access_token(
+            Principal("user-1", Role.MANAGER, "legacy-user-uuid"),
+            settings=_settings(),
+        )
+
+
+def test_decoder_rejects_a_signed_legacy_tenant_token():
+    settings = _settings()
+    token = jwt.encode(
+        {
+            "sub": "user-1",
+            "role": Role.MANAGER.value,
+            "tenant_id": "legacy-user-uuid",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+        },
+        settings.jwt_secret_key.get_secret_value(),
+        algorithm="HS256",
+    )
+
+    with pytest.raises(ApiError) as exc_info:
+        decode_access_token(token, settings=settings)
+
+    assert exc_info.value.code == "INVALID_TOKEN"
+
+
 @pytest.mark.parametrize(
     ("role", "allowed"),
     [
         (Role.MANAGER, (Role.MANAGER,)),
         (Role.BUSINESS_ADMIN, (Role.BUSINESS_ADMIN,)),
+        (Role.SYSTEM_ADMIN, (Role.SYSTEM_ADMIN,)),
         (
             Role.BUSINESS_ADMIN,
             (Role.MANAGER, Role.BUSINESS_ADMIN, Role.SYSTEM_ADMIN),

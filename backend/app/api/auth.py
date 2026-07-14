@@ -4,8 +4,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import get_principal, get_session
-from app.auth.models import DEMO_TENANT_ID, Principal
-from app.auth.security import create_access_token, verify_password
+from app.auth.models import Principal
+from app.auth.security import (
+    BANK_DEMO_TENANT_ID,
+    create_access_token,
+    verify_password,
+)
 from app.config import Settings, get_settings
 from app.db.models import User
 from app.errors import ApiError
@@ -40,7 +44,7 @@ async def login(
     ):
         raise ApiError(401, "INVALID_CREDENTIALS", "用户名或密码错误")
 
-    principal = Principal(user.id, user.role, DEMO_TENANT_ID)
+    principal = Principal(user.id, user.role, BANK_DEMO_TENANT_ID)
     return TokenResponse(
         access_token=create_access_token(principal, settings=settings)
     )
