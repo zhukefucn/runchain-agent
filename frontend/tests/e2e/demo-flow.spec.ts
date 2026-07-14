@@ -78,7 +78,15 @@ async function runReception(page: Page, username: string, sharedSkillName: strin
   await page.getByLabel("给接待主管发送消息").fill(
     "接待 4 位远方客人，明天 18:00 到南京南站，安排接站、住宿和清淡餐饮。",
   );
-  await page.getByRole("button", { name: /发送/ }).click();
+  const [chatResponse] = await Promise.all([
+    page.waitForResponse(
+      (response) => response.url().endsWith(`/api/manager/sessions/${sessionId}/chat`)
+        && response.request().method() === "POST",
+    ),
+    page.getByRole("button", { name: /发送/ }).click(),
+  ]);
+  const chatRequestId = chatResponse.headers()["x-request-id"];
+  expect(chatRequestId).toBeTruthy();
   await expect(page.locator(".hitl-card")).toBeVisible({ timeout: 45_000 });
   await expect(page.locator(".agent-roster")).toContainText("接站");
   await expect(page.locator(".agent-roster")).toContainText("住宿");
@@ -97,7 +105,7 @@ async function runReception(page: Page, username: string, sharedSkillName: strin
   await expect(finalPlan).toContainText("七座商务车（Mock）");
   await expect(finalPlan).not.toContainText(principal.user_id);
   await expect(finalPlan).not.toContainText(/team_id|worker_ids|_agentscope/);
-  return { principal, sessionId };
+  return { principal, sessionId, chatRequestId };
 }
 
 test("approved 11-step multi-tenant browser demonstration", async ({ browser }) => {
@@ -241,8 +249,16 @@ test("approved 11-step multi-tenant browser demonstration", async ({ browser }) 
   await expect(system.getByText("mcp.call", { exact: true }).first()).toBeVisible();
   await expect(system.getByText("manager.messages.read", { exact: true }).first()).toBeVisible();
   await expect(system.locator("tbody tr", { hasText: "skill.invoke" }).filter({ hasText: "failure" }).first()).toBeVisible();
-  const currentAudits = await api<{ items: Array<{ action: string }> }>(system, "/api/system/audit-logs");
+  const currentAudits = await api<{
+    items: Array<{ action: string; request_id: string | null }>;
+  }>(system, "/api/system/audit-logs");
   expect(currentAudits.items.filter((row) => row.action === "system.user.patch")).toHaveLength(2);
+  const mcpRequestIds = currentAudits.items
+    .filter((row) => row.action === "mcp.call")
+    .map((row) => row.request_id);
+  expect(mcpRequestIds).toEqual(
+    expect.arrayContaining([run1.chatRequestId, run2.chatRequestId]),
+  );
   await system.goto("/business");
   await expect(system).toHaveURL(/\/system$/);
   expect(await apiStatus(system, "/api/business/skills")).toBe(403);

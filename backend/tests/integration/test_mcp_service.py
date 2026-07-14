@@ -145,6 +145,7 @@ def test_local_mcp_round_trip_discovery_health_and_restart(tmp_path):
                 "station": "南京南站",
                 "guest_count": 3,
             },
+            request_id="chat-request-123",
         )
         assert result["mock"] is True
         assert result["guest_count"] == 3
@@ -157,6 +158,10 @@ def test_local_mcp_round_trip_discovery_health_and_restart(tmp_path):
         assert await service.health(_principal(users["business_admin01"]), server.id)
         actions = {row.action for row in await db.scalars(select(AuditRecordRow))}
         assert {"mcp.health", "mcp.list_tools", "mcp.call"}.issubset(actions)
+        mcp_call = await db.scalar(
+            select(AuditRecordRow).where(AuditRecordRow.action == "mcp.call")
+        )
+        assert mcp_call.request_id == "chat-request-123"
 
     asyncio.run(_scenario(tmp_path, check))
 

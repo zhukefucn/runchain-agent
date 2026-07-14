@@ -62,7 +62,20 @@ async def test_reception_team_uses_real_templates_and_three_mock_tool_paths(tmp_
     from app.agents.reception import ReceptionTeamRuntime, reception_subagent_templates
 
     engine, sessions, users = await _runtime_db(tmp_path)
-    runtime = ReceptionTeamRuntime(sessions)
+    governed_call = {}
+
+    async def governed_provider(owner_user_id, session_id, prompt, request_id):
+        governed_call.update(
+            owner_user_id=owner_user_id,
+            session_id=session_id,
+            prompt=prompt,
+            request_id=request_id,
+        )
+        return {}
+
+    runtime = ReceptionTeamRuntime(
+        sessions, governed_tool_provider=governed_provider
+    )
     manager = users["manager0001"]
 
     events = [
@@ -92,6 +105,10 @@ async def test_reception_team_uses_real_templates_and_three_mock_tool_paths(tmp_
         "dining",
     }
     assert events[-1].type == "hitl_pending"
+    assert governed_call["owner_user_id"] == manager.id
+    assert governed_call["session_id"] == "reception-session-1"
+    assert governed_call["request_id"] == "request-manager-1"
+    assert governed_call["prompt"]
     assert all(
         event.request_id == "request-manager-1"
         and event.session_id == "reception-session-1"
@@ -753,7 +770,31 @@ def test_alembic_upgrades_task10_schema_with_node_and_hitl_lifecycle_columns(tmp
         connection.execute(
             text(
                 "CREATE TABLE sessions (id VARCHAR(100), owner_user_id VARCHAR(36), "
+                "agent_id VARCHAR(100), title VARCHAR(200), source VARCHAR(32), "
                 "PRIMARY KEY (owner_user_id, id))"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE agentscope_storage_records ("
+                "owner_user_id VARCHAR(36), namespace VARCHAR(40), "
+                "record_id VARCHAR(160), payload JSON, "
+                "PRIMARY KEY (owner_user_id, namespace, record_id))"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, owner_user_id, agent_id, title, source) VALUES "
+                "('worker-session', 'manager-1', 'worker-agent', 'team:pickup', 'user'), "
+                "('user-session', 'manager-1', 'leader-agent', 'team:user-visible', 'user')"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agentscope_storage_records "
+                "(owner_user_id, namespace, record_id, payload) VALUES "
+                "('manager-1', 'agent', 'worker-agent', '{\"source\":\"team\"}'), "
+                "('manager-1', 'agent', 'leader-agent', '{\"source\":\"user\"}')"
             )
         )
         connection.execute(
@@ -785,6 +826,13 @@ def test_alembic_upgrades_task10_schema_with_node_and_hitl_lifecycle_columns(tmp
         "decided_at",
     }
     assert "alembic_version" in schema.get_table_names()
+    with engine.connect() as connection:
+        visibility = dict(
+            connection.execute(
+                text("SELECT id, is_internal FROM sessions ORDER BY id")
+            ).all()
+        )
+    assert visibility == {"user-session": 0, "worker-session": 1}
     downgrade_database_url(url)
     schema = inspect(engine)
     assert "team_node_runs" not in schema.get_table_names()

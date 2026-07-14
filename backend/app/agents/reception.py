@@ -25,7 +25,7 @@ from .sse import StableEvent
 
 AgentTool = Callable[[str, str], Awaitable[dict[str, Any]]]
 GovernedToolProvider = Callable[
-    [str, str, str], Awaitable[dict[str, AgentTool]]
+    [str, str, str, str], Awaitable[dict[str, AgentTool]]
 ]
 logger = logging.getLogger(__name__)
 _AGENT_TYPES = ("pickup", "lodging", "dining")
@@ -363,7 +363,9 @@ class ReceptionTeamRuntime:
             tools = dict(self._tools)
             if self._governed_tool_provider is not None:
                 tools.update(
-                    await self._governed_tool_provider(owner_user_id, session_id, prompt)
+                    await self._governed_tool_provider(
+                        owner_user_id, session_id, prompt, request_id
+                    )
                 )
             raw_results = await asyncio.gather(*(tools[k](owner_user_id, prompt) for k in _AGENT_TYPES), return_exceptions=True)
             results = dict(zip(_AGENT_TYPES, raw_results, strict=True))

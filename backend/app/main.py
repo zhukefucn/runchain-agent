@@ -187,7 +187,7 @@ def create_root_app(
     runtime: dict[str, Any] = {}
 
     async def governed_reception_tools(
-        owner_user_id: str, session_id: str, prompt: str
+        owner_user_id: str, session_id: str, prompt: str, request_id: str
     ):
         async with sessions() as db:
             session = await db.get(SessionRecordRow, (owner_user_id, session_id))
@@ -240,7 +240,7 @@ def create_root_app(
                     session_id,
                     skill.id,
                     {"prompt": current_prompt},
-                    request_id=str(uuid4()),
+                    request_id=request_id,
                 )
 
             paths["dining"] = dining
@@ -257,6 +257,7 @@ def create_root_app(
                         "station": "南京南站",
                         "guest_count": 4,
                     },
+                    request_id=request_id,
                 )
 
             paths["pickup"] = pickup

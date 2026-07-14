@@ -760,6 +760,7 @@ class McpService:
         server_id: str,
         tool_name: str,
         arguments: dict[str, Any],
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         result = "failure"
         runtime: _Runtime | None = None
@@ -850,7 +851,9 @@ class McpService:
                 await self._retire_failed_runtime(
                     actor, server_id, runtime, retire_code
                 )
-            await self._audit_call_uncancellable(actor, server_id, result)
+            await self._audit_call_uncancellable(
+                actor, server_id, result, request_id=request_id
+            )
 
     async def _retire_failed_runtime(
         self,
@@ -872,7 +875,13 @@ class McpService:
                     details={"operation": "disconnect", "status": "failure"},
                 )
 
-    async def _audit_call(self, actor: Principal, server_id: str, result: str) -> None:
+    async def _audit_call(
+        self,
+        actor: Principal,
+        server_id: str,
+        result: str,
+        request_id: str | None = None,
+    ) -> None:
         async with self._sessions() as db:
             AuditRepository(db).add_pending(
                 actor_user_id=actor.user_id,
@@ -880,15 +889,21 @@ class McpService:
                 resource_type="mcp_server",
                 resource_id=server_id,
                 result=result,
-                request_id=None,
+                request_id=request_id,
                 details={"operation": "invoke", "status": result},
             )
             await db.commit()
 
     async def _audit_call_uncancellable(
-        self, actor: Principal, server_id: str, result: str
+        self,
+        actor: Principal,
+        server_id: str,
+        result: str,
+        request_id: str | None = None,
     ) -> None:
-        task = asyncio.create_task(self._audit_call(actor, server_id, result))
+        task = asyncio.create_task(
+            self._audit_call(actor, server_id, result, request_id=request_id)
+        )
         cancelled = False
         while not task.done():
             try:

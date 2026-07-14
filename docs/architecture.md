@@ -65,9 +65,9 @@ Toolkit 不是跨用户共享的全局对象。Agent 创建时按当前 manager�
 接待场景用于展示多 Agent，不代表真实接待业务：
 
 - 接待主管：创建 Team、拆解、汇总并发起 HITL。
-- 接站 Agent：走本机 Mock MCP 形态的接站路径。
+- 接站 Agent：优先调用已授权且正在运行的本机 MCP Server；未配置时使用确定性的 MCP 形态 Mock 回退。
 - 住宿 Agent：走进程内 Mock Tool。
-- 餐饮 Agent：走已授权 Python Skill 形态的 Mock 路径。
+- 餐饮 Agent：优先调用已发布且已授权的 Python Skill，由 Controlled Runner 真实执行；未配置时使用确定性的 Runner 形态 Mock 回退。
 
 三个 worker 使用 AgentScope `SubAgentTemplate` 注册，并通过 AgentScope Team/Agent 创建工具持久化 Team 结构。三个任务并发执行，节点状态写入 `team_node_runs`；汇总后写入 `hitl_requests` 并暂停。manager 可确认、修改或取消，后端再次校验 HITL、Team run、session 和 owner 后原子恢复。
 
@@ -103,6 +103,8 @@ business_admin 只能从浏览器上传本机 ZIP。Skill 包必须含单一根�
 Python Skill 在独立子进程中以结构化 JSON 输入/输出执行，受超时、输出、内存、进程数、并发数和 Windows Job Object 控制。它是可信代码 Runner，不是恶意代码沙箱。
 
 MCP 配置由 business_admin 创建。Phase 1 只接受 allowlist 中的本机 Python Server、规范化 Python 可执行文件和空环境配置；模型密钥不会传给 MCP。Runtime Registry 管理启动、健康、Tool 发现、调用和退出清理。
+
+接待专家团在每次对话时按当前 manager/session 动态选择上述受控能力：有可用授权时走真实 Skill Runner 和 MCP `CallTool`，否则才使用结构相同的确定性 Mock 回退，确保全新环境也能演示编排。HTTP 对话的 `request_id` 会贯穿专家团 runtime，并写入 Skill 与 MCP 调用审计，便于端到端关联一次演示请求。
 
 ## 7. 生命周期与就绪
 

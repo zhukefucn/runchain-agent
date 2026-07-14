@@ -94,7 +94,7 @@ Python Tool、prompt Tool 和 MCP Tool 的 callback 都闭包捕获验证后的 
 
 `reception_subagent_templates()` 注册 `pickup`、`lodging`、`dining` 三种 AgentScope `SubAgentTemplate`。接待 runtime 使用适配后的 TeamCreate/AgentCreate 工具创建真实 AgentScope Team 与成员，并将 Team ID/worker ID、节点运行和 HITL 状态写入持久化层。
 
-Phase 1 的三个专业结果是确定性 Mock：接站使用 MCP-client-shaped adapter，住宿使用内置 Mock Tool，餐饮使用 controlled-runner-service-shaped adapter。这样可以稳定演示并发编排和失败/HITL 行为；实际 MCP Server 注册调用和真实 Python Skill 执行另有独立完整链路。Phase 2 可替换模板和 Tool 配置，不需要改变 manager 隔离核心。
+Phase 1 的接待业务语义仍是 Mock，但受治理的执行路径是真实的：runtime 优先查找当前 manager 已授权的运行中 MCP Server，并通过 `McpService.call_tool()` 执行接站；同时优先查找已发布、已授权的 Python Skill，并通过 Controlled Runner 执行餐饮。只有缺少相应授权能力时才回退到 MCP-client-shaped 和 controlled-runner-service-shaped 确定性适配器，住宿保持进程内 Mock Tool。HTTP 对话的 `request_id` 会透传到 governed provider、Skill/MCP 调用及审计记录。这样既能在全新环境稳定展示并发编排、失败和 HITL，也能证明两个 manager 的真实授权与隔离链路；Phase 2 可替换模板和 Tool 配置，不需要改变 manager 隔离核心。
 
 ## 9. SSE 稳定化
 
