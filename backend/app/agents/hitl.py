@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -12,6 +13,16 @@ from .sse import StableEvent
 
 
 Decision = Literal["approve", "reject", "modification"]
+
+
+def _deep_merge(base: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in changes.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
 
 
 class HitlNotFound(LookupError):
@@ -102,6 +113,21 @@ class HitlService:
                 "reject": "rejected",
                 "modification": "modified",
             }[decision]
+            original_plan = deepcopy(run.result_data or {})
+            if decision == "reject":
+                final_plan = None
+                terminal_result = {
+                    "status": "rejected",
+                    "decision": "reject",
+                    "original_plan": original_plan,
+                }
+            else:
+                final_plan = deepcopy(original_plan)
+                if decision == "modification":
+                    final_plan = _deep_merge(final_plan, normalized)
+                final_plan["status"] = status
+                final_plan["decision"] = decision
+                terminal_result = final_plan
             now = datetime.now(timezone.utc)
             events = (
                 StableEvent(
@@ -120,6 +146,8 @@ class HitlService:
                         "decision": decision,
                         "status": status,
                         "modifications": normalized,
+                        "plan": final_plan,
+                        "result": terminal_result,
                     },
                 ),
             )
@@ -148,6 +176,7 @@ class HitlService:
                 .values(
                     status="rejected" if decision == "reject" else "completed",
                     completed_at=now,
+                    result_data=terminal_result,
                 )
             )
             await db.commit()

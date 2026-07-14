@@ -74,6 +74,7 @@ async def test_hitl_owner_isolation_idempotency_and_conflict(tmp_path):
     assert first.status == "approved"
     assert first.events[-1].type == "complete"
     assert first.events[-1].data["decision"] == "approve"
+    assert first.events[-1].data["plan"]["pickup"]["vehicle"] == "Mock 7-seat van"
 
     with pytest.raises(HitlConflict) as conflict:
         await service.decide(
@@ -93,7 +94,14 @@ async def test_hitl_owner_isolation_idempotency_and_conflict(tmp_path):
 @pytest.mark.parametrize(
     ("decision", "modifications", "expected_status"),
     [
-        ("modification", {"restaurant": "mock-vegetarian"}, "modified"),
+        (
+            "modification",
+            {
+                "restaurant": "mock-vegetarian",
+                "lodging": {"hotel": "Mock Conference Hotel"},
+            },
+            "modified",
+        ),
         ("reject", None, "rejected"),
     ],
 )
@@ -116,4 +124,42 @@ async def test_hitl_modification_and_reject_resume_to_complete(
     assert [event.type for event in result.events] == ["token", "complete"]
     assert result.events[0].data["phase"] == "resumed"
     assert result.events[-1].data["modifications"] == (modifications or {})
+    async with sessions() as db:
+        run = await db.scalar(
+            select(TeamRunRow).where(
+                TeamRunRow.owner_user_id == users["manager0002"].id
+            )
+        )
+    if decision == "modification":
+        assert result.events[-1].data["plan"]["restaurant"] == "mock-vegetarian"
+        assert run.result_data["restaurant"] == "mock-vegetarian"
+        assert run.result_data["lodging"]["hotel"] == "Mock Conference Hotel"
+        assert run.result_data["lodging"]["rooms"] == 2
+    else:
+        assert result.events[-1].data["plan"] is None
+        assert run.result_data["status"] == "rejected"
+    await engine.dispose()
+
+
+@_async_test
+async def test_concurrent_conflicting_hitl_decisions_only_one_wins(tmp_path):
+    from app.agents.hitl import HitlConflict, HitlService
+
+    engine, sessions, users, request_id = await _pending_request(tmp_path)
+    owner = users["manager0001"].id
+    outcomes = await asyncio.gather(
+        HitlService(sessions).decide(owner, request_id, "approve", None),
+        HitlService(sessions).decide(owner, request_id, "reject", None),
+        return_exceptions=True,
+    )
+    assert sum(not isinstance(item, BaseException) for item in outcomes) == 1
+    assert sum(isinstance(item, HitlConflict) for item in outcomes) == 1
+    async with sessions() as db:
+        run = await db.scalar(
+            select(TeamRunRow).where(TeamRunRow.owner_user_id == owner)
+        )
+    winner = next(item for item in outcomes if not isinstance(item, BaseException))
+    assert run.result_data == winner.events[-1].data["plan"] or (
+        winner.status == "rejected" and run.result_data["status"] == "rejected"
+    )
     await engine.dispose()

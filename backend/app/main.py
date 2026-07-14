@@ -271,7 +271,13 @@ def create_root_app(
     app.state.runner_capabilities_verified = False
     app.state.model_configured = False
     app.state.custom_subagent_templates = list(templates)
-    app.state.reception_runtime = ReceptionTeamRuntime(sessions, templates=list(templates))
+    app.state.reception_runtime = ReceptionTeamRuntime(
+        sessions,
+        templates=list(templates),
+        storage=storage,
+        message_bus=bus,
+        workspace_manager=workspace,
+    )
     app.state.hitl_service = HitlService(sessions)
     app.add_middleware(_IdentitySanitizerMiddleware)
     install_error_handlers(app)

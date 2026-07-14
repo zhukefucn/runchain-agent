@@ -11,8 +11,12 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentscope.app import SubAgentTemplate
+from agentscope.app._tool import AgentCreate, TeamCreate
+from agentscope.app.message_bus import InMemoryMessageBus, MessageBus
+from agentscope.app.storage import StorageBase
 
 from app.db.models import HitlRequestRow, Role, SessionRecordRow, TeamNodeRunRow, TeamRunRow, User
+from app.agentscope_ext.sqlite_storage import SQLiteStorage
 from .sse import StableEvent
 
 
@@ -31,9 +35,9 @@ def reception_subagent_templates() -> list[SubAgentTemplate]:
         "仅使用已授权工具生成确定性的 Mock 建议，并向主管 {leader_name} 返回结构化结果。"
     )
     return [
-        SubAgentTemplate(type="pickup", description="接站专家：通过本机 Mock MCP 规划车辆、时间和路线。", system_prompt_template=prompt),
-        SubAgentTemplate(type="lodging", description="住宿专家：通过进程内 Mock Tool 规划酒店与入住。", system_prompt_template=prompt),
-        SubAgentTemplate(type="dining", description="餐饮专家：通过授权 Python Skill 形态规划餐饮。", system_prompt_template=prompt),
+        SubAgentTemplate(type="pickup", description="接站专家：通过本机 Mock MCP 规划车辆、时间和路线。", system_prompt_template="[pickup-template] " + prompt),
+        SubAgentTemplate(type="lodging", description="住宿专家：通过进程内 Mock Tool 规划酒店与入住。", system_prompt_template="[lodging-template] " + prompt),
+        SubAgentTemplate(type="dining", description="餐饮专家：通过授权 Python Skill 形态规划餐饮。", system_prompt_template="[dining-template] " + prompt),
     ]
 
 
@@ -87,8 +91,13 @@ async def _await_uncancellable(awaitable) -> None:
 class ReceptionTeamRuntime:
     """Deterministic Phase-1 orchestration over real AgentScope templates."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, pickup_tool: AgentTool | None = None, lodging_tool: AgentTool | None = None, dining_skill: AgentTool | None = None, templates: list[SubAgentTemplate] | None = None) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, pickup_tool: AgentTool | None = None, lodging_tool: AgentTool | None = None, dining_skill: AgentTool | None = None, templates: list[SubAgentTemplate] | None = None, storage: StorageBase | None = None, message_bus: MessageBus | None = None, workspace_manager: Any = None, after_hitl_commit: Callable[[], Awaitable[None]] | None = None, before_cancel_finalize: Callable[[], Awaitable[None]] | None = None) -> None:
         self._sessions = session_factory
+        self._storage = storage or SQLiteStorage(session_factory)
+        self._message_bus = message_bus or InMemoryMessageBus()
+        self._workspace_manager = workspace_manager or object()
+        self._after_hitl_commit = after_hitl_commit
+        self._before_cancel_finalize = before_cancel_finalize
         self.tool_paths = {
             "pickup": pickup_tool or MockMcpPickupPath(),
             "lodging": lodging_tool or MockLodgingTool(),
@@ -118,6 +127,59 @@ class ReceptionTeamRuntime:
             await db.commit()
             return run.id
 
+    async def _create_agentscope_workers(
+        self,
+        owner: str,
+        session_id: str,
+        prompt: str,
+        run_id: str,
+    ) -> dict[str, Any]:
+        leader = await self._storage.get_session(owner, "", session_id)
+        if leader is None:
+            raise PermissionError("AgentScope leader session not found")
+        kwargs = {
+            "storage": self._storage,
+            "message_bus": self._message_bus,
+            "workspace_manager": self._workspace_manager,
+            "user_id": owner,
+            "session_id": session_id,
+            "agent_id": leader.agent_id,
+        }
+        if leader.team_id is None:
+            await TeamCreate(**kwargs)(
+                name=f"reception-{run_id[:8]}",
+                description="远方客人接待：接站、住宿、餐饮三角色并行协作。",
+            )
+            leader = await self._storage.get_session(owner, "", session_id)
+        if leader is None or leader.team_id is None:
+            raise RuntimeError("AgentScope TeamCreate did not persist a team")
+
+        template_registry = {template.type: template for template in self.templates}
+        creator = AgentCreate(
+            **kwargs,
+            sub_agent_templates=template_registry,
+        )
+        before = await self._storage.get_team(owner, leader.team_id)
+        before_ids = {member.agent_id for member in before.data.members} if before else set()
+        for agent_type in _AGENT_TYPES:
+            await creator(
+                name=f"{agent_type}-{run_id[:8]}",
+                description=f"{agent_type} reception specialist",
+                prompt=prompt,
+                subagent_type=agent_type,
+            )
+        team = await self._storage.get_team(owner, leader.team_id)
+        if team is None:
+            raise RuntimeError("AgentScope team disappeared during worker creation")
+        worker_ids = [
+            member.agent_id
+            for member in team.data.members
+            if member.agent_id not in before_ids
+        ]
+        if len(worker_ids) != len(_AGENT_TYPES):
+            raise RuntimeError("AgentScope AgentCreate did not persist all workers")
+        return {"team_id": team.id, "worker_ids": worker_ids}
+
     async def _persist_results(self, owner: str, run_id: str, results: dict[str, dict[str, Any] | BaseException]) -> bool:
         now = datetime.now(timezone.utc)
         failed = False
@@ -134,29 +196,37 @@ class ReceptionTeamRuntime:
             await db.commit()
         return failed
 
-    async def _persist_hitl(self, owner: str, run_id: str, prompt: str, results: dict[str, dict[str, Any] | BaseException]) -> str:
+    async def _persist_hitl(self, owner: str, run_id: str, prompt: str, results: dict[str, dict[str, Any] | BaseException], agentscope_team: dict[str, Any]) -> str:
         request = HitlRequestRow(team_run_id=run_id, owner_user_id=owner, prompt=prompt, status="pending")
         summary = {key: value for key, value in results.items() if isinstance(value, dict)}
+        summary["_agentscope"] = agentscope_team
         async with self._sessions() as db:
             db.add(request)
             await db.execute(update(TeamRunRow).where(TeamRunRow.id == run_id, TeamRunRow.owner_user_id == owner).values(status="hitl_pending", result_data=summary))
             await db.commit()
             await db.refresh(request)
-            return request.id
+        if self._after_hitl_commit is not None:
+            await self._after_hitl_commit()
+        return request.id
 
     async def _persist_cancelled(self, owner: str, run_id: str) -> None:
+        if self._before_cancel_finalize is not None:
+            await self._before_cancel_finalize()
         now = datetime.now(timezone.utc)
         async with self._sessions() as db:
-            await db.execute(update(TeamNodeRunRow).where(TeamNodeRunRow.team_run_id == run_id, TeamNodeRunRow.owner_user_id == owner, TeamNodeRunRow.status == "running").values(status="cancelled", completed_at=now, error_code="RUN_CANCELLED"))
-            await db.execute(update(TeamRunRow).where(TeamRunRow.id == run_id, TeamRunRow.owner_user_id == owner).values(status="cancelled", completed_at=now))
+            run_update = await db.execute(update(TeamRunRow).where(TeamRunRow.id == run_id, TeamRunRow.owner_user_id == owner, TeamRunRow.status == "running").values(status="cancelled", completed_at=now))
+            if run_update.rowcount == 1:
+                await db.execute(update(TeamNodeRunRow).where(TeamNodeRunRow.team_run_id == run_id, TeamNodeRunRow.owner_user_id == owner, TeamNodeRunRow.status == "running").values(status="cancelled", completed_at=now, error_code="RUN_CANCELLED"))
             await db.commit()
 
     async def chat(self, owner_user_id: str, session_id: str, prompt: str, *, request_id: str | None = None) -> AsyncIterator[StableEvent]:
         request_id = request_id or str(uuid4())
         run_id = await self._start_run(owner_user_id, session_id, request_id)
-        hitl_persisted = False
         try:
             yield self._event("run_started", request_id, session_id, run_id, mode="reception_team")
+            agentscope_team = await self._create_agentscope_workers(
+                owner_user_id, session_id, prompt, run_id
+            )
             yield self._event("token", request_id, session_id, run_id, agent_type="leader", text="主管已拆解接站、住宿、餐饮三个并行任务。")
             for agent_type in _AGENT_TYPES:
                 yield self._event("agent_started", request_id, session_id, run_id, agent_type=agent_type)
@@ -174,19 +244,23 @@ class ReceptionTeamRuntime:
             if failed:
                 yield self._event("error", request_id, session_id, run_id, code="TEAM_NODE_FAILED", message="Mock expert team execution failed")
                 return
-            hitl_id = await self._persist_hitl(owner_user_id, run_id, prompt, results)
-            hitl_persisted = True
+            hitl_id = await self._persist_hitl(
+                owner_user_id, run_id, prompt, results, agentscope_team
+            )
             yield self._event("hitl_pending", request_id, session_id, run_id, request_id=hitl_id, summary={k: v for k, v in results.items() if isinstance(v, dict)})
         except asyncio.CancelledError:
-            if not hitl_persisted:
-                try:
-                    await _await_uncancellable(self._persist_cancelled(owner_user_id, run_id))
-                except asyncio.CancelledError:
-                    pass
+            try:
+                await _await_uncancellable(self._persist_cancelled(owner_user_id, run_id))
+            except asyncio.CancelledError:
+                pass
             raise
         except GeneratorExit:
-            if not hitl_persisted:
-                await asyncio.shield(self._persist_cancelled(owner_user_id, run_id))
+            try:
+                await _await_uncancellable(
+                    self._persist_cancelled(owner_user_id, run_id)
+                )
+            except asyncio.CancelledError:
+                pass
             raise
 
 

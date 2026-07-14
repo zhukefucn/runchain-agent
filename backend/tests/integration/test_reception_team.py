@@ -21,6 +21,7 @@ from app.db.models import (
 )
 from app.db.seed import seed_demo_data
 from app.db.session import build_async_engine, create_schema
+from app.agentscope_ext.sqlite_storage import SQLiteStorage
 
 
 def _async_test(function):
@@ -121,6 +122,29 @@ async def test_reception_team_uses_real_templates_and_three_mock_tool_paths(tmp_
         for node in nodes
     )
     assert hitl is not None and hitl.status == "pending"
+
+    storage = SQLiteStorage(sessions)
+    leader_session = await storage.get_session(
+        manager.id, "reception-leader", "reception-session-1"
+    )
+    assert leader_session.team_id is not None
+    team = await storage.get_team(manager.id, leader_session.team_id)
+    assert team is not None
+    assert len(team.data.members) == 3
+    worker_agents = [
+        await storage.get_agent(manager.id, member.agent_id)
+        for member in team.data.members
+    ]
+    assert all(agent is not None and agent.source == "team" for agent in worker_agents)
+    assert {
+        marker
+        for marker in ("pickup", "lodging", "dining")
+        if any(
+            f"[{marker}-template]" in agent.data.system_prompt
+            for agent in worker_agents
+            if agent is not None
+        )
+    } == {"pickup", "lodging", "dining"}
     await engine.dispose()
 
 
@@ -213,6 +237,53 @@ async def test_cancelled_reception_run_persists_terminal_node_state(tmp_path):
         )
     assert run.status == "cancelled" and run.completed_at is not None
     assert nodes and all(node.status != "running" for node in nodes)
+    await engine.dispose()
+
+
+@_async_test
+async def test_repeated_cancel_during_finalize_still_persists_terminal_state(tmp_path):
+    from app.agents.reception import ReceptionTeamRuntime
+
+    engine, sessions, users = await _runtime_db(tmp_path)
+    tool_entered = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def slow_pickup(_owner, _prompt):
+        tool_entered.set()
+        await asyncio.Event().wait()
+
+    async def before_finalize():
+        cleanup_entered.set()
+        await cleanup_release.wait()
+
+    runtime = ReceptionTeamRuntime(
+        sessions,
+        pickup_tool=slow_pickup,
+        before_cancel_finalize=before_finalize,
+    )
+    task = asyncio.create_task(
+        _collect(
+            runtime.chat(
+                users["manager0001"].id,
+                "reception-session-1",
+                "repeat cancel",
+                request_id="repeat-cancel",
+            )
+        )
+    )
+    await asyncio.wait_for(tool_entered.wait(), timeout=3)
+    task.cancel()
+    await asyncio.wait_for(cleanup_entered.wait(), timeout=3)
+    task.cancel()
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    async with sessions() as db:
+        run = await db.scalar(
+            select(TeamRunRow).where(TeamRunRow.request_id == "repeat-cancel")
+        )
+    assert run.status == "cancelled" and run.completed_at is not None
     await engine.dispose()
 
 
@@ -311,6 +382,69 @@ async def test_disconnect_after_hitl_event_keeps_persisted_pending_state(tmp_pat
 
 
 @_async_test
+async def test_cancel_at_hitl_commit_boundary_preserves_pending_state(tmp_path):
+    from app.agents.reception import ReceptionTeamRuntime
+
+    engine, sessions, users = await _runtime_db(tmp_path)
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def after_commit():
+        committed.set()
+        await release.wait()
+
+    runtime = ReceptionTeamRuntime(sessions, after_hitl_commit=after_commit)
+    task = asyncio.create_task(
+        _collect(
+            runtime.chat(
+                users["manager0001"].id,
+                "reception-session-1",
+                "boundary cancellation",
+                request_id="hitl-boundary",
+            )
+        )
+    )
+    await asyncio.wait_for(committed.wait(), timeout=3)
+    task.cancel()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    async with sessions() as db:
+        run = await db.scalar(
+            select(TeamRunRow).where(TeamRunRow.request_id == "hitl-boundary")
+        )
+        hitl = await db.scalar(
+            select(HitlRequestRow).where(HitlRequestRow.team_run_id == run.id)
+        )
+    assert run.status == "hitl_pending" and run.completed_at is None
+    assert hitl.status == "pending"
+    await engine.dispose()
+
+
+@_async_test
+async def test_cross_manager_cannot_run_reception_in_foreign_session(tmp_path):
+    from app.agents.reception import ReceptionTeamRuntime
+
+    engine, sessions, users = await _runtime_db(tmp_path)
+    with pytest.raises(PermissionError):
+        await _collect(
+            ReceptionTeamRuntime(sessions).chat(
+                users["manager0002"].id,
+                "reception-session-1",
+                "foreign session",
+                request_id="foreign-run",
+            )
+        )
+    async with sessions() as db:
+        assert await db.scalar(
+            select(TeamRunRow).where(TeamRunRow.request_id == "foreign-run")
+        ) is None
+    storage = SQLiteStorage(sessions)
+    assert await storage.list_teams(users["manager0002"].id) == []
+    await engine.dispose()
+
+
+@_async_test
 async def test_failed_team_node_emits_sanitized_error_and_persists_timestamp(tmp_path):
     from app.agents.reception import ReceptionTeamRuntime
 
@@ -368,6 +502,11 @@ def test_root_app_injects_reception_templates_by_default(tmp_path, monkeypatch):
         "dining",
     }
     assert app.state.reception_runtime.templates == app.state.custom_subagent_templates
+    assert set(app.state.agentscope_app.state.custom_subagent_templates) >= {
+        "pickup",
+        "lodging",
+        "dining",
+    }
     assert app.state.hitl_service is not None
 
 
