@@ -32,7 +32,13 @@ from agentscope.message import TextBlock
 from agentscope.state import AgentState
 
 from app.agentscope_ext.sqlite_storage import SQLiteStorage
-from app.db.models import AgentScopeStorageRow, MessageRow, Role, User
+from app.db.models import (
+    AgentScopeStorageRow,
+    MessageRow,
+    Role,
+    SessionRecordRow,
+    User,
+)
 from app.db.session import build_async_engine, create_schema
 from app.repositories.manager import ManagerRepository
 from agentscope.app.storage import StorageBase
@@ -497,7 +503,9 @@ def test_concurrent_messages_are_serialized_without_loss_or_duplicate_ordinals(
 
         async def repository_write(session_id: str, index: int) -> None:
             async with storage._session_factory() as db:
-                created = await ManagerRepository(db).create_message(
+                created = await ManagerRepository(
+                    db, write_session_factory=storage._session_factory
+                ).create_message(
                     "manager0001",
                     session_id,
                     role="user",
@@ -555,6 +563,150 @@ def test_concurrent_messages_are_serialized_without_loss_or_duplicate_ordinals(
                 )
             )
         assert len(mixed_ordinals) == len(set(mixed_ordinals)) == 12
+
+    asyncio.run(_with_storage(tmp_path, check))
+
+
+def test_repository_message_writer_does_not_commit_caller_transaction(tmp_path) -> None:
+    async def check(storage: SQLiteStorage) -> None:
+        owner = "manager0001"
+        session_id = "caller-transaction"
+        await storage.upsert_session(
+            owner,
+            "agent",
+            _config("committed-title"),
+            session_id=session_id,
+        )
+
+        async with storage._session_factory() as caller:
+            row = await caller.scalar(
+                select(SessionRecordRow).where(SessionRecordRow.id == session_id)
+            )
+            assert row is not None
+            row.title = "uncommitted-title"
+            await caller.flush()
+
+            repository = ManagerRepository(
+                caller, write_session_factory=storage._session_factory
+            )
+            write_task = asyncio.create_task(
+                repository.create_message(
+                    owner,
+                    session_id,
+                    role="user",
+                    content="independent writer",
+                )
+            )
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(write_task), timeout=0.1)
+                async with storage._session_factory() as observer:
+                    visible_title = await observer.scalar(
+                        select(SessionRecordRow.title).where(
+                            SessionRecordRow.id == session_id
+                        )
+                    )
+                assert visible_title == "committed-title"
+            finally:
+                await caller.rollback()
+
+            created = await asyncio.wait_for(write_task, timeout=5)
+            assert created is not None
+
+        restored = await storage.get_session(owner, "agent", session_id)
+        assert restored is not None
+        assert restored.config.name == "committed-title"
+        async with storage._session_factory() as observer:
+            restored_title = await observer.scalar(
+                select(SessionRecordRow.title).where(SessionRecordRow.id == session_id)
+            )
+        assert restored_title == "committed-title"
+        assert [item.id for item in await storage.list_messages(owner, session_id)]
+
+    asyncio.run(_with_storage(tmp_path, check))
+
+
+def test_repository_write_entrypoints_fail_closed_without_writer_factory(
+    tmp_path,
+) -> None:
+    async def check(storage: SQLiteStorage) -> None:
+        owner = "manager0001"
+        session_id = "missing-writer-factory"
+        await storage.upsert_session(
+            owner, "agent", _config("fail-closed"), session_id=session_id
+        )
+
+        async with storage._session_factory() as caller:
+            repository = ManagerRepository(caller)
+            assert (
+                await repository.create_message(
+                    owner, session_id, role="user", content="must not persist"
+                )
+                is None
+            )
+            assert not await repository.delete_session(owner, session_id)
+
+        assert await storage.get_session(owner, "agent", session_id) is not None
+        assert await storage.list_messages(owner, session_id) == []
+
+    asyncio.run(_with_storage(tmp_path, check))
+
+
+@pytest.mark.parametrize("message_writer", ["adapter", "repository"])
+def test_ordinary_session_delete_and_message_write_are_safely_serialized(
+    tmp_path, message_writer: str
+) -> None:
+    async def check(storage: SQLiteStorage) -> None:
+        owner = "manager0001"
+        session_id = f"delete-race-{message_writer}"
+        await storage.upsert_session(
+            owner, "agent", _config(message_writer), session_id=session_id
+        )
+        start = asyncio.Event()
+
+        async def delete_session() -> bool:
+            await start.wait()
+            async with storage._session_factory() as caller:
+                return await ManagerRepository(
+                    caller, write_session_factory=storage._session_factory
+                ).delete_session(owner, session_id)
+
+        async def write_message() -> bool:
+            await start.wait()
+            if message_writer == "adapter":
+                try:
+                    await storage.upsert_message(
+                        owner,
+                        session_id,
+                        Msg(
+                            id="racing-message",
+                            name="user",
+                            role="user",
+                            content=[TextBlock(type="text", text="racing")],
+                        ),
+                    )
+                except IntegrityError:
+                    return False
+                return True
+            async with storage._session_factory() as caller:
+                created = await ManagerRepository(
+                    caller, write_session_factory=storage._session_factory
+                ).create_message(
+                    owner,
+                    session_id,
+                    role="user",
+                    content="racing",
+                )
+            return created is not None
+
+        delete_task = asyncio.create_task(delete_session())
+        write_task = asyncio.create_task(write_message())
+        start.set()
+        deleted, _written = await asyncio.gather(delete_task, write_task)
+
+        assert deleted
+        assert await storage.get_session(owner, "agent", session_id) is None
+        assert await storage.list_messages(owner, session_id) == []
 
     asyncio.run(_with_storage(tmp_path, check))
 
@@ -638,7 +790,11 @@ def test_repository_team_session_delete_delegates_or_fails_closed(tmp_path) -> N
             await storage.set_session_team_id(owner, session_id, "repo-team")
 
         async with storage._session_factory() as db:
-            repository = ManagerRepository(db, session_storage=storage)
+            repository = ManagerRepository(
+                db,
+                session_storage=storage,
+                write_session_factory=storage._session_factory,
+            )
             assert await repository.delete_session(owner, "repo-leader-session")
         assert await storage.get_team(owner, "repo-team") is None
         assert await storage.get_agent(owner, "repo-created") is None
@@ -670,7 +826,9 @@ def test_repository_team_session_delete_delegates_or_fails_closed(tmp_path) -> N
             owner, "closed-leader-session", "closed-team"
         )
         async with storage._session_factory() as db:
-            repository = ManagerRepository(db)
+            repository = ManagerRepository(
+                db, write_session_factory=storage._session_factory
+            )
             assert not await repository.delete_session(
                 owner, "closed-leader-session"
             )
@@ -737,7 +895,9 @@ def test_manager_repository_and_adapter_share_canonical_sessions_and_messages(
             "manager0001", "adapter-agent", _config("adapter"), session_id="adapter-session"
         )
         async with storage._session_factory() as db:
-            repository = ManagerRepository(db)
+            repository = ManagerRepository(
+                db, write_session_factory=storage._session_factory
+            )
             visible = await repository.get_session("manager0001", adapter_session.id)
             assert visible is not None and visible.agent_id == "adapter-agent"
             repository_session = await repository.create_session(
@@ -760,7 +920,9 @@ def test_manager_repository_and_adapter_share_canonical_sessions_and_messages(
             ),
         )
         async with storage._session_factory() as db:
-            repository = ManagerRepository(db)
+            repository = ManagerRepository(
+                db, write_session_factory=storage._session_factory
+            )
             rows = await repository.list_messages(
                 "manager0001", repository_session.id
             )

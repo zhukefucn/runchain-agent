@@ -3,7 +3,7 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.exc import IntegrityError
 
 from app.db.models import (
@@ -26,7 +26,8 @@ async def _with_repositories(tmp_path, check: Callable[..., Awaitable[None]]) ->
     engine = build_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'isolation.db'}")
     try:
         await create_schema(engine)
-        async with AsyncSession(engine, expire_on_commit=False) as db:
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as db:
             db.add_all(
                 User(
                     id=owner,
@@ -45,7 +46,11 @@ async def _with_repositories(tmp_path, check: Callable[..., Awaitable[None]]) ->
                 )
             )
             await db.commit()
-            await check(db, ManagerRepository(db), AuditRepository(db))
+            await check(
+                db,
+                ManagerRepository(db, write_session_factory=factory),
+                AuditRepository(db),
+            )
     finally:
         await engine.dispose()
 
