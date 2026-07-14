@@ -488,6 +488,244 @@ def test_concurrent_messages_are_serialized_without_loss_or_duplicate_ordinals(
         merged = await storage.list_messages("manager0001", "merge")
         assert len(merged) == 1 and merged[0].id == "same-reply"
 
+        await storage.upsert_session(
+            "manager0001",
+            "agent",
+            _config("repository-concurrent"),
+            session_id="repository-concurrent",
+        )
+
+        async def repository_write(session_id: str, index: int) -> None:
+            async with storage._session_factory() as db:
+                created = await ManagerRepository(db).create_message(
+                    "manager0001",
+                    session_id,
+                    role="user",
+                    content=f"repository-{index}",
+                )
+                assert created is not None
+
+        await asyncio.gather(
+            *(repository_write("repository-concurrent", index) for index in range(12))
+        )
+        repository_messages = await storage.list_messages(
+            "manager0001", "repository-concurrent"
+        )
+        assert len(repository_messages) == 12
+        async with storage._session_factory() as db:
+            repository_ordinals = list(
+                await db.scalars(
+                    select(MessageRow.ordinal).where(
+                        MessageRow.owner_user_id == "manager0001",
+                        MessageRow.session_id == "repository-concurrent",
+                    )
+                )
+            )
+        assert len(repository_ordinals) == len(set(repository_ordinals)) == 12
+
+        await storage.upsert_session(
+            "manager0001", "agent", _config("mixed"), session_id="mixed"
+        )
+
+        await asyncio.gather(
+            *(
+                storage.upsert_message(
+                    "manager0001",
+                    "mixed",
+                    Msg(
+                        id=f"adapter-{index}",
+                        name="assistant",
+                        role="assistant",
+                        content=[TextBlock(type="text", text=f"adapter-{index}")],
+                    ),
+                )
+                for index in range(6)
+            ),
+            *(repository_write("mixed", index) for index in range(6)),
+        )
+        mixed = await storage.list_messages("manager0001", "mixed")
+        assert len(mixed) == 12
+        async with storage._session_factory() as db:
+            mixed_ordinals = list(
+                await db.scalars(
+                    select(MessageRow.ordinal).where(
+                        MessageRow.owner_user_id == "manager0001",
+                        MessageRow.session_id == "mixed",
+                    )
+                )
+            )
+        assert len(mixed_ordinals) == len(set(mixed_ordinals)) == 12
+
+    asyncio.run(_with_storage(tmp_path, check))
+
+
+def test_repository_team_session_delete_delegates_or_fails_closed(tmp_path) -> None:
+    async def check(storage: SQLiteStorage) -> None:
+        owner = "manager0001"
+        for agent_id, source in (
+            ("repo-leader", "user"),
+            ("repo-created", "team"),
+            ("repo-invited", "user"),
+            ("closed-leader", "user"),
+        ):
+            await storage.upsert_agent(owner, _agent(owner, agent_id, source=source))
+        await storage.upsert_schedule(
+            owner,
+            ScheduleRecord(
+                id="repo-team-schedule",
+                user_id=owner,
+                agent_id="repo-leader",
+                data=ScheduleData(
+                    name="team schedule",
+                    cron_expression="0 9 * * *",
+                    chat_model_config=ChatModelConfig(
+                        type="demo",
+                        credential_id="credential",
+                        model="model",
+                        parameters={},
+                    ),
+                ),
+            ),
+        )
+        for agent_id in (
+            "repo-leader",
+            "repo-created",
+            "repo-invited",
+            "closed-leader",
+        ):
+            await storage.upsert_session(
+                owner,
+                agent_id,
+                _config(agent_id),
+                session_id=f"{agent_id}-session",
+                source=(
+                    SessionSource.SCHEDULE
+                    if agent_id == "repo-leader"
+                    else SessionSource.USER
+                ),
+                source_schedule_id=(
+                    "repo-team-schedule" if agent_id == "repo-leader" else None
+                ),
+            )
+        team = TeamRecord(
+            id="repo-team",
+            user_id=owner,
+            session_id="repo-leader-session",
+            data=TeamData(
+                name="repo-team",
+                members=[
+                    TeamMember(
+                        owner_id=owner,
+                        agent_id="repo-created",
+                        session_id="repo-created-session",
+                        role="created",
+                    ),
+                    TeamMember(
+                        owner_id=owner,
+                        agent_id="repo-invited",
+                        session_id="repo-invited-session",
+                        role="invited",
+                    ),
+                ],
+            ),
+        )
+        await storage.upsert_team(owner, team)
+        for session_id in (
+            "repo-leader-session",
+            "repo-created-session",
+            "repo-invited-session",
+        ):
+            await storage.set_session_team_id(owner, session_id, "repo-team")
+
+        async with storage._session_factory() as db:
+            repository = ManagerRepository(db, session_storage=storage)
+            assert await repository.delete_session(owner, "repo-leader-session")
+        assert await storage.get_team(owner, "repo-team") is None
+        assert await storage.get_agent(owner, "repo-created") is None
+        assert await storage.get_session(
+            owner, "repo-created", "repo-created-session"
+        ) is None
+        assert await storage.get_agent(owner, "repo-invited") is not None
+        assert await storage.get_session(
+            owner, "repo-invited", "repo-invited-session"
+        ) is None
+        assert await storage.get_session(
+            owner, "repo-leader", "repo-leader-session"
+        ) is None
+        assert await storage.get_schedule(owner, "repo-team-schedule") is not None
+        assert await storage.list_sessions_by_schedule(
+            owner, "repo-team-schedule"
+        ) == []
+
+        await storage.upsert_team(
+            owner,
+            TeamRecord(
+                id="closed-team",
+                user_id=owner,
+                session_id="closed-leader-session",
+                data=TeamData(name="closed"),
+            ),
+        )
+        await storage.set_session_team_id(
+            owner, "closed-leader-session", "closed-team"
+        )
+        async with storage._session_factory() as db:
+            repository = ManagerRepository(db)
+            assert not await repository.delete_session(
+                owner, "closed-leader-session"
+            )
+            assert not await repository.delete_session(
+                "manager0002", "closed-leader-session"
+            )
+        assert await storage.get_session(
+            owner, "closed-leader", "closed-leader-session"
+        ) is not None
+
+    asyncio.run(_with_storage(tmp_path, check))
+
+
+def test_document_registration_and_kb_delete_are_one_transaction(tmp_path) -> None:
+    async def check(storage: SQLiteStorage) -> None:
+        owner = "manager0001"
+        for index in range(6):
+            kb_id = f"race-kb-{index}"
+            await storage.upsert_knowledge_base(
+                owner, _knowledge_base(owner, kb_id)
+            )
+            gate = asyncio.Event()
+
+            async def register_document() -> object:
+                await gate.wait()
+                try:
+                    return await storage.upsert_knowledge_document(
+                        owner,
+                        KnowledgeDocumentRecord(
+                            id="race-document",
+                            user_id=owner,
+                            knowledge_base_id=kb_id,
+                            data=KnowledgeDocumentData(
+                                filename="race.txt",
+                                size=1,
+                                blob_uri="local://race",
+                            ),
+                        ),
+                    )
+                except ValueError as error:
+                    return error
+
+            async def delete_parent() -> bool:
+                await gate.wait()
+                return await storage.delete_knowledge_base(owner, kb_id)
+
+            register_task = asyncio.create_task(register_document())
+            delete_task = asyncio.create_task(delete_parent())
+            gate.set()
+            await asyncio.gather(register_task, delete_task)
+            assert await storage.get_knowledge_base(owner, kb_id) is None
+            assert await storage.get_knowledge_document(
+                owner, kb_id, "race-document"
+            ) is None
+
     asyncio.run(_with_storage(tmp_path, check))
 
 

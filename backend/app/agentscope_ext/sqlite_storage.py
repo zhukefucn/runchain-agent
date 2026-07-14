@@ -122,6 +122,30 @@ class SQLiteStorage(StorageBase):
         parent_id: str | None = None,
         ordinal: int = 0,
     ) -> None:
+        async with self._session_factory() as db:
+            await self._put_with_session(
+                db,
+                owner,
+                namespace,
+                record_id,
+                payload,
+                parent_id=parent_id,
+                ordinal=ordinal,
+            )
+            await db.commit()
+
+    async def _put_with_session(
+        self,
+        db: AsyncSession,
+        owner: str,
+        namespace: str,
+        record_id: str,
+        payload: dict[str, Any],
+        *,
+        parent_id: str | None = None,
+        ordinal: int = 0,
+    ) -> None:
+        """Atomic generic upsert inside the caller's current transaction."""
         now = datetime.now()
         statement = sqlite_insert(AgentScopeStorageRow).values(
             owner_user_id=owner,
@@ -142,9 +166,7 @@ class SQLiteStorage(StorageBase):
                 "updated_at": now,
             },
         )
-        async with self._session_factory() as db:
-            await db.execute(statement)
-            await db.commit()
+        await db.execute(statement)
 
     async def _list_payloads(
         self,
@@ -555,36 +577,63 @@ class SQLiteStorage(StorageBase):
     async def delete_knowledge_base(
         self, user_id: str, knowledge_base_id: str
     ) -> bool:
-        if await self.get_knowledge_base(user_id, knowledge_base_id) is None:
-            return False
-        for document in await self.list_knowledge_documents(user_id, knowledge_base_id):
-            await self.delete_knowledge_document(user_id, knowledge_base_id, document.id)
-        return await self._delete(user_id, "knowledge_base", knowledge_base_id)
+        async with self._session_factory() as db:
+            await db.execute(text("BEGIN IMMEDIATE"))
+            parent = await db.get(
+                AgentScopeStorageRow,
+                (user_id, "knowledge_base", knowledge_base_id),
+            )
+            if parent is None:
+                await db.rollback()
+                return False
+            await db.execute(
+                delete(AgentScopeStorageRow).where(
+                    AgentScopeStorageRow.owner_user_id == user_id,
+                    AgentScopeStorageRow.namespace == "knowledge_document",
+                    AgentScopeStorageRow.parent_id == knowledge_base_id,
+                )
+            )
+            await db.delete(parent)
+            await db.commit()
+            return True
 
     async def upsert_knowledge_document(
         self, user_id: str, record: KnowledgeDocumentRecord
     ) -> KnowledgeDocumentRecord:
         if record.user_id != user_id:
             raise ValueError("record.user_id does not match user_id")
-        if (
-            await self.get_knowledge_base(user_id, record.knowledge_base_id)
-            is None
-        ):
-            raise ValueError("knowledge document parent does not exist for owner")
-        current = await self.get_knowledge_document(
-            user_id, record.knowledge_base_id, record.id
-        )
-        if current:
-            record.created_at = current.created_at
-        record.updated_at = datetime.now()
-        await self._put(
-            user_id,
-            "knowledge_document",
-            self._document_key(record.knowledge_base_id, record.id),
-            self._dump(record),
-            parent_id=record.knowledge_base_id,
-        )
-        return record
+        key = self._document_key(record.knowledge_base_id, record.id)
+        async with self._session_factory() as db:
+            await db.execute(text("BEGIN IMMEDIATE"))
+            parent = await db.get(
+                AgentScopeStorageRow,
+                (user_id, "knowledge_base", record.knowledge_base_id),
+            )
+            if parent is None:
+                await db.rollback()
+                raise ValueError(
+                    "knowledge document parent does not exist for owner"
+                )
+            current_row = await db.get(
+                AgentScopeStorageRow,
+                (user_id, "knowledge_document", key),
+            )
+            if current_row is not None:
+                current = KnowledgeDocumentRecord.model_validate(
+                    current_row.payload
+                )
+                record.created_at = current.created_at
+            record.updated_at = datetime.now()
+            await self._put_with_session(
+                db,
+                user_id,
+                "knowledge_document",
+                key,
+                self._dump(record),
+                parent_id=record.knowledge_base_id,
+            )
+            await db.commit()
+            return record
 
     async def get_knowledge_document(
         self, user_id: str, knowledge_base_id: str, document_id: str

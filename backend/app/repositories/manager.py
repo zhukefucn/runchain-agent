@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from sqlalchemy import delete, exists, func, select, update
+from typing import Protocol
+
+from sqlalchemy import delete, exists, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -13,11 +15,22 @@ from app.db.models import (
 )
 
 
+class SessionStorage(Protocol):
+    async def delete_session(
+        self, user_id: str, agent_id: str, session_id: str
+    ) -> bool: ...
+
+
 class ManagerRepository:
     """Access manager business data only through an explicit owner boundary."""
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        session_storage: SessionStorage | None = None,
+    ) -> None:
         self._db = db
+        self._session_storage = session_storage
 
     @staticmethod
     def _parent_is_owned(child_model, owner_user_id: str):
@@ -106,6 +119,21 @@ class ManagerRepository:
         return result.rowcount == 1
 
     async def delete_session(self, owner_user_id: str, session_id: str) -> bool:
+        row = await self.get_session(owner_user_id, session_id)
+        if row is None:
+            return False
+        if row.team_id is not None:
+            # Team deletion is role-aware and belongs to StorageBase. Never
+            # duplicate it here: either delegate to the injected canonical
+            # storage boundary or fail closed.
+            if self._session_storage is None:
+                await self._db.rollback()
+                return False
+            agent_id = row.agent_id
+            await self._db.rollback()
+            return await self._session_storage.delete_session(
+                owner_user_id, agent_id, session_id
+            )
         result = await self._db.execute(
             delete(SessionRecordRow).where(
                 SessionRecordRow.id == session_id,
@@ -124,7 +152,23 @@ class ManagerRepository:
         role: str,
         content: str,
     ) -> MessageRow | None:
-        if await self.get_session(owner_user_id, session_id) is None:
+        if self._db.new or self._db.dirty or self._db.deleted:
+            raise RuntimeError("create_message requires a clean transaction boundary")
+        if self._db.in_transaction():
+            # Read-only repository calls may leave an implicit transaction.
+            # The clean-state guard above makes commit safe and, unlike
+            # rollback, it does not expire already-returned ORM objects.
+            await self._db.commit()
+        await self._db.execute(text("BEGIN IMMEDIATE"))
+        owned_session = await self._db.scalar(
+            select(SessionRecordRow.id).where(
+                SessionRecordRow.id == session_id,
+                SessionRecordRow.owner_user_id == owner_user_id,
+                self._owner_is_manager(owner_user_id),
+            )
+        )
+        if owned_session is None:
+            await self._db.commit()
             return None
         ordinal = await self._db.scalar(
             select(func.coalesce(func.max(MessageRow.ordinal), -1) + 1).where(
@@ -141,7 +185,6 @@ class ManagerRepository:
         )
         self._db.add(row)
         await self._db.commit()
-        await self._db.refresh(row)
         return row
 
     async def list_messages(
