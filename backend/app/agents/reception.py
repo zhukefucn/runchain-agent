@@ -84,7 +84,10 @@ class AgentScopeSubagentExecutor:
         else:
             # Await the worker turn so the expert-team run represents actual
             # completed AgentScope execution, not only a queued wake signal.
-            await chat_service.run(
+            # ``run`` intentionally swallows provider/runtime failures. The
+            # pinned AgentScope service's implementation entry point preserves
+            # them, allowing this orchestration to mark the worker as failed.
+            await chat_service._run_impl(
                 user_id=owner_user_id,
                 session_id=worker_session_id,
                 agent_id=worker_agent_id,

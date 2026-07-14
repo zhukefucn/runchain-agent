@@ -79,7 +79,7 @@ AgentScope ChatService 会实例化 Agent。RunChain 传入 app-instance runtime
 
 ## 7. 动态 Toolkit 适配
 
-`extra_agent_tools(user_id, agent_id, session_id)` 在 Agent 构建时调用 `AuthorizedToolService`。它不会返回全局共享 Toolkit，而是每次完成以下校验：
+`extra_agent_tools(user_id, agent_id, session_id)` 在 Agent 构建时调用 `AuthorizedToolService`。内部专家团 worker 明确返回空 governed-tool 集合，由编排层负责唯一一次受审计副作用；普通 manager 会话则不会返回全局共享 Toolkit，而是每次完成以下校验：
 
 1. user 是启用的 manager；
 2. session 的 owner、agent 和 active 状态全部匹配；
@@ -92,7 +92,7 @@ Python Tool、prompt Tool 和 MCP Tool 的 callback 都闭包捕获验证后的 
 
 ## 8. Team 与 SubAgentTemplate
 
-`reception_subagent_templates()` 注册 `pickup`、`lodging`、`dining` 三种 AgentScope `SubAgentTemplate`。接待 runtime 使用适配后的 TeamCreate/AgentCreate 工具创建真实 AgentScope Team 与成员，并将 Team ID/worker ID、节点运行和 HITL 状态写入持久化层。
+`reception_subagent_templates()` 注册 `pickup`、`lodging`、`dining` 三种 AgentScope `SubAgentTemplate`。接待 runtime 使用适配后的 TeamCreate/AgentCreate 工具创建并复用真实 AgentScope Team 与成员，并将 Team ID/worker ID、节点运行和 HITL 状态写入持久化层。每个 worker 通过被 `agentscope-source.lock.json` 固定的 `ChatService` 执行入口完成回合；该入口保留模型/运行时异常，使编排层能够可靠地将 worker 标记为失败，而不是把失败吞掉后继续展示成功。
 
 Phase 1 的接待业务语义仍是 Mock，但受治理的执行路径是真实的：runtime 优先查找当前 manager 已授权的运行中 MCP Server，并通过 `McpService.call_tool()` 执行接站；同时优先查找已发布、已授权的 Python Skill，并通过 Controlled Runner 执行餐饮。只有缺少相应授权能力时才回退到 MCP-client-shaped 和 controlled-runner-service-shaped 确定性适配器，住宿保持进程内 Mock Tool。HTTP 对话的 `request_id` 会透传到 governed provider、Skill/MCP 调用及审计记录。这样既能在全新环境稳定展示并发编排、失败和 HITL，也能证明两个 manager 的真实授权与隔离链路；Phase 2 可替换模板和 Tool 配置，不需要改变 manager 隔离核心。
 

@@ -372,6 +372,35 @@ def test_root_app_liveness_readiness_identity_bridge_and_clean_lifespan(tmp_path
             session_id=session_id,
         )
 
+        # Internal expert workers execute through AgentScope but cannot invoke
+        # the manager's governed Skill/MCP tools; the orchestration owns the
+        # single audited side effect after the worker turn succeeds.
+        extra_tools = app.state.agentscope_app.state.extra_agent_tools
+        authorized = app.state.authorized_tool_service
+        original_authorized_tools = authorized.authorized_tools
+        authorized_calls = []
+
+        async def recording_authorized_tools(*args):
+            authorized_calls.append(args)
+            return ["governed-sentinel"]
+
+        authorized.authorized_tools = recording_authorized_tools
+        async with app.state.session_factory() as db:
+            row = await db.get(SessionRecordRow, (principal.user_id, session_id))
+            row.is_internal = True
+            await db.commit()
+        assert await extra_tools(principal.user_id, agent_id, session_id) == []
+        assert authorized_calls == []
+        async with app.state.session_factory() as db:
+            row = await db.get(SessionRecordRow, (principal.user_id, session_id))
+            row.is_internal = False
+            await db.commit()
+        assert await extra_tools(principal.user_id, agent_id, session_id) == [
+            "governed-sentinel"
+        ]
+        assert authorized_calls == [(principal.user_id, agent_id, session_id)]
+        authorized.authorized_tools = original_authorized_tools
+
         # Native workspace management is deliberately not part of the demo's
         # manager surface. Skills and MCP servers are installed/authorized only
         # through the governed business-admin APIs.
@@ -486,7 +515,7 @@ def test_root_app_liveness_readiness_identity_bridge_and_clean_lifespan(tmp_path
         assert (await client.get(
             "/internal/agentscope/agents",
             headers={"Authorization": f"Bearer {admin_token}"},
-        )).status_code == 403
+        )).status_code == 404
 
         original_workspace = settings.workspace_root
         unavailable = tmp_path / "not-a-directory"

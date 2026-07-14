@@ -242,7 +242,7 @@ async def test_subagent_executor_awaits_chat_service_before_mock_tool():
     calls: list[tuple[str, str]] = []
 
     class ChatService:
-        async def run(self, *, user_id, session_id, agent_id, input_msg=None):
+        async def _run_impl(self, *, user_id, session_id, agent_id, input_msg=None):
             assert input_msg is None
             calls.append(("agent", f"{user_id}:{agent_id}:{session_id}"))
 
@@ -268,6 +268,39 @@ async def test_subagent_executor_awaits_chat_service_before_mock_tool():
         ("agent", "manager-id:worker-id:worker-session"),
         ("tool", "manager-id:receive guests"),
     ]
+
+
+@_async_test
+async def test_subagent_executor_propagates_worker_failure_without_running_tool():
+    from agentscope.app.message_bus import InMemoryMessageBus
+
+    from app.agents.reception import AgentScopeSubagentExecutor
+
+    tool_called = False
+
+    class FailingChatService:
+        async def _run_impl(self, **_kwargs):
+            raise RuntimeError("worker failed")
+
+    async def tool(_owner_user_id: str, _prompt: str):
+        nonlocal tool_called
+        tool_called = True
+        return {"ok": True}
+
+    executor = AgentScopeSubagentExecutor(
+        InMemoryMessageBus(),
+        chat_service_provider=FailingChatService,
+    )
+    with pytest.raises(RuntimeError, match="worker failed"):
+        await executor.execute(
+            owner_user_id="manager-id",
+            worker_agent_id="worker-id",
+            worker_session_id="worker-session",
+            agent_type="pickup",
+            prompt="receive guests",
+            tool=tool,
+        )
+    assert tool_called is False
 
 
 @_async_test

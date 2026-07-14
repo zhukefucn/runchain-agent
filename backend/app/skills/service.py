@@ -386,7 +386,11 @@ class SkillService:
         async with lock:
             existing = await self._repository.get_version(manifest.name, manifest.version)
             if existing is not None:
-                if existing.upload_sha256 != package.upload_sha256:
+                # ZIP container metadata (notably DOS timestamps) may differ
+                # while the validated canonical files are byte-identical.
+                # Idempotency is therefore content-based, while the original
+                # upload digest remains retained for provenance.
+                if existing.content_sha256 != package.content_sha256:
                     raise SkillConflictError("Skill name and version already exists")
                 destination, marker = await self._verify_integrity(
                     existing, allow_marker=True

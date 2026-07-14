@@ -269,6 +269,14 @@ def create_root_app(
         return paths
 
     async def extra_tools(user_id: str, agent_id: str, session_id: str):
+        async with sessions() as db:
+            session = await db.get(SessionRecordRow, (user_id, session_id))
+        if (
+            session is None
+            or session.agent_id != agent_id
+            or session.is_internal
+        ):
+            return []
         return await runtime["authorized_tool_service"].authorized_tools(
             user_id, agent_id, session_id
         )
@@ -454,7 +462,6 @@ def create_root_app(
         native_manager_routes = (
             "/internal/agentscope/chat",
             "/internal/agentscope/agent",
-            "/internal/agentscope/agents",
             "/internal/agentscope/sessions",
         )
         if not any(

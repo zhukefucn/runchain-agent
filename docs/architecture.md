@@ -69,7 +69,7 @@ Toolkit 不是跨用户共享的全局对象。Agent 创建时按当前 manager�
 - 住宿 Agent：走进程内 Mock Tool。
 - 餐饮 Agent：优先调用已发布且已授权的 Python Skill，由 Controlled Runner 真实执行；未配置时使用确定性的 Runner 形态 Mock 回退。
 
-三个 worker 使用 AgentScope `SubAgentTemplate` 注册，并通过 AgentScope Team/Agent 创建工具持久化 Team 结构。三个任务并发执行，节点状态写入 `team_node_runs`；汇总后写入 `hitl_requests` 并暂停。manager 可确认、修改或取消，后端再次校验 HITL、Team run、session 和 owner 后原子恢复。
+三个 worker 使用 AgentScope `SubAgentTemplate` 注册，并通过 AgentScope Team/Agent 创建工具持久化 Team 结构。每个 worker 都先通过固定版本 AgentScope `ChatService` 完成真实推理回合；内部 worker 不注入 manager 的 governed Skill/MCP，避免模型重复产生副作用。worker 成功后，编排层才各执行一次确定性的角色工具并收集结构化结果；worker/模型失败会直接使对应节点失败。三个任务并发执行，节点状态写入 `team_node_runs`；汇总后写入 `hitl_requests` 并暂停。manager 可确认、修改或取消，后端再次校验 HITL、Team run、session 和 owner 后原子恢复。
 
 对浏览器公开的是稳定 SSE 契约：`run_started`、`token`、`agent_started`、`tool_call`、`tool_result`、`agent_completed`、`hitl_pending`、`complete`、`error`。每个事件都包含 request、session、run、timestamp 和 data。AgentScope 内部事件格式变化不会直接泄漏给前端。
 

@@ -47,7 +47,7 @@ def test_built_frontend_is_served_without_shadowing_api_routes(
     assert asset.text == "window.runchain=true"
     assert missing_api.status_code == 404
     assert missing_api.headers["content-type"].startswith("application/json")
-    assert protected_internal.status_code == 401
+    assert protected_internal.status_code == 404
 
 
 def test_missing_frontend_build_returns_clear_503(tmp_path: Path) -> None:
