@@ -152,6 +152,77 @@ def test_both_managers_are_isolated_and_client_cannot_supply_owner(tmp_path):
     asyncio.run(scenario())
 
 
+def test_messages_get_does_not_audit_chat_but_missing_post_chat_does(tmp_path):
+    async def scenario():
+        async with _client(tmp_path) as (client, app):
+            headers = await _auth(client, "manager0001")
+            read = await client.get(
+                "/api/manager/sessions/missing/messages", headers=headers
+            )
+            posted = await client.post(
+                "/api/manager/sessions/missing/chat",
+                headers=headers,
+                json={"prompt": "missing"},
+            )
+            assert read.status_code == posted.status_code == 404
+            async with app.state.session_factory() as db:
+                read_audits = list(
+                    await db.scalars(
+                        select(AuditRecordRow).where(
+                            AuditRecordRow.request_id == read.headers["X-Request-ID"]
+                        )
+                    )
+                )
+                post_audits = list(
+                    await db.scalars(
+                        select(AuditRecordRow).where(
+                            AuditRecordRow.request_id == posted.headers["X-Request-ID"]
+                        )
+                    )
+                )
+            assert read_audits == []
+            assert len(post_audits) == 1
+            assert post_audits[0].action == "manager.chat.start"
+            assert post_audits[0].result == "failure"
+
+    asyncio.run(scenario())
+
+
+def test_post_chat_message_creation_race_is_audited(monkeypatch, tmp_path):
+    async def scenario():
+        from app.repositories.manager import ManagerRepository
+
+        async with _client(tmp_path) as (client, app):
+            headers = await _auth(client, "manager0001")
+            created = await client.post(
+                "/api/manager/sessions",
+                headers=headers,
+                json={"title": "race", "agent_id": "reception-leader"},
+            )
+
+            async def disappeared(*_args, **_kwargs):
+                return None
+
+            monkeypatch.setattr(ManagerRepository, "create_message", disappeared)
+            response = await client.post(
+                f"/api/manager/sessions/{created.json()['id']}/chat",
+                headers=headers,
+                json={"prompt": "race"},
+            )
+            assert response.status_code == 404
+            async with app.state.session_factory() as db:
+                audits = list(
+                    await db.scalars(
+                        select(AuditRecordRow).where(
+                            AuditRecordRow.request_id == response.headers["X-Request-ID"]
+                        )
+                    )
+                )
+            assert len(audits) == 1 and audits[0].result == "failure"
+
+    asyncio.run(scenario())
+
+
 def test_manager_stream_sanitizes_runtime_errors_and_closes_nested_generator(tmp_path):
     class BrokenRuntime:
         def __init__(self):
@@ -441,6 +512,12 @@ def test_failed_and_idempotent_skill_mutation_attempts_keep_http_request_ids(tmp
                 )
             assert {row.request_id for row in rows} == expected_ids
             assert {row.result for row in rows} == {"success", "failure"}
+            repeated = next(
+                row
+                for row in rows
+                if row.request_id == second.headers["X-Request-ID"]
+            )
+            assert repeated.details["status"] == "idempotent"
 
     asyncio.run(scenario())
 
@@ -460,6 +537,51 @@ def test_missing_mcp_test_is_404_and_failure_is_audited(tmp_path):
                     )
                 )
             assert row is not None and row.result == "failure"
+
+    asyncio.run(scenario())
+
+
+def test_mcp_test_all_start_failures_have_exactly_one_request_audit(tmp_path):
+    from app.mcp.service import (
+        McpConflictError,
+        McpNotFoundError,
+        McpUnavailableError,
+    )
+
+    class FailingMcp:
+        error: Exception
+
+        async def start(self, _actor, _server_id, request_id=None):
+            raise self.error
+
+    async def scenario():
+        async with _client(tmp_path) as (client, app):
+            headers = await _auth(client, "business_admin01")
+            fake = FailingMcp()
+            app.state.mcp_service = fake
+            cases = [
+                (McpConflictError("key conflict"), 409),
+                (McpUnavailableError("not ready"), 503),
+                (McpNotFoundError("missing"), 404),
+            ]
+            for error, status_code in cases:
+                fake.error = error
+                response = await client.post(
+                    "/api/business/mcp-servers/server/test", headers=headers
+                )
+                assert response.status_code == status_code
+                async with app.state.session_factory() as db:
+                    audits = list(
+                        await db.scalars(
+                            select(AuditRecordRow).where(
+                                AuditRecordRow.request_id
+                                == response.headers["X-Request-ID"],
+                                AuditRecordRow.result == "failure",
+                            )
+                        )
+                    )
+                assert len(audits) == 1
+                assert "key conflict" not in json.dumps(audits[0].details)
 
     asyncio.run(scenario())
 
@@ -608,6 +730,11 @@ def test_system_model_status_sanitizes_url_and_failed_users_are_audited(tmp_path
                     "not_checked",
                     "not_configured",
                 }
+                app.state.model_connectivity = "reachable"
+                observed = await client.get(
+                    "/api/system/model/status", headers=headers
+                )
+                assert observed.json()["connectivity"] == "reachable"
                 duplicate = await client.post(
                     "/api/system/users",
                     headers=headers,

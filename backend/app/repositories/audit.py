@@ -44,6 +44,7 @@ _ALLOWED_ENUM_FIELDS: dict[str, frozenset[str]] = {
             "failed",
             "failure",
             "inactive",
+            "idempotent",
             "not_found",
             "pending",
             "rejected",

@@ -193,15 +193,18 @@ async def patch_user(
 @router.get("/model/status")
 async def model_status(request: Request, _principal: SystemPrincipal):
     settings = request.app.state.settings
+    observed_connectivity = getattr(request.app.state, "model_connectivity", None)
+    if observed_connectivity not in {"reachable", "unreachable"}:
+        observed_connectivity = (
+            "not_checked"
+            if bool(request.app.state.model_configured)
+            else "not_configured"
+        )
     return {
         "configured": bool(request.app.state.model_configured),
         "model": settings.model_name,
         "base_url": _safe_model_url(settings.model_base_url),
-        "connectivity": (
-            "not_checked"
-            if bool(request.app.state.model_configured)
-            else "not_configured"
-        ),
+        "connectivity": observed_connectivity,
     }
 
 

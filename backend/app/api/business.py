@@ -9,7 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import get_session, require_role
 from app.auth.models import Principal
-from app.db.models import McpServerRow, Role, SkillInvocationRow, SkillRow
+from app.db.models import (
+    AuditRecordRow,
+    McpServerRow,
+    Role,
+    SkillInvocationRow,
+    SkillRow,
+)
 from app.errors import ApiError
 from app.mcp.service import (
     McpConflictError,
@@ -106,6 +112,34 @@ async def _audit_failure(
                 "status": "failure",
                 "status_code": status_code,
             },
+        )
+
+
+async def _audit_failure_once(
+    request: Request,
+    actor: Principal,
+    action: str,
+    resource_type: str,
+    resource_id: str | None,
+    operation: str,
+    status_code: int,
+) -> None:
+    async with request.app.state.session_factory() as db:
+        existing = await db.scalar(
+            select(AuditRecordRow.id).where(
+                AuditRecordRow.request_id == request.state.request_id,
+                AuditRecordRow.result == "failure",
+            )
+        )
+    if existing is None:
+        await _audit_failure(
+            request,
+            actor,
+            action,
+            resource_type,
+            resource_id,
+            operation,
+            status_code,
         )
 
 
@@ -334,10 +368,15 @@ async def test_mcp_server(
         )
     except Exception as error:
         api_error = _mcp_error(error)
-        if isinstance(error, McpNotFoundError):
-            await _audit_failure(
-                request, principal, "mcp.test", "mcp_server", server_id, "connect", api_error.status_code
-            )
+        await _audit_failure_once(
+            request,
+            principal,
+            "mcp.test",
+            "mcp_server",
+            server_id,
+            "connect",
+            api_error.status_code,
+        )
         raise api_error from error
     return {"server_id": server_id, "healthy": healthy, "tools": tools}
 

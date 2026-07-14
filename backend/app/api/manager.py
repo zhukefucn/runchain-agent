@@ -139,16 +139,6 @@ async def list_messages(
 ):
     repository = _manager_repository(request, db)
     if await repository.get_session(principal.user_id, session_id) is None:
-        await _audit(
-            request,
-            principal,
-            "manager.chat.start",
-            "session",
-            session_id,
-            "invoke",
-            result="failure",
-            status_code=404,
-        )
         raise ApiError(404, "NOT_FOUND", "资源不存在")
     rows = await repository.list_messages(principal.user_id, session_id)
     return {"items": [_message(row) for row in rows]}
@@ -164,6 +154,16 @@ async def chat(
 ):
     repository = _manager_repository(request, db)
     if await repository.get_session(principal.user_id, session_id) is None:
+        await _audit(
+            request,
+            principal,
+            "manager.chat.start",
+            "session",
+            session_id,
+            "invoke",
+            result="failure",
+            status_code=404,
+        )
         raise ApiError(404, "NOT_FOUND", "资源不存在")
     if (
         await repository.create_message(
@@ -171,6 +171,16 @@ async def chat(
         )
         is None
     ):
+        await _audit(
+            request,
+            principal,
+            "manager.chat.start",
+            "session",
+            session_id,
+            "invoke",
+            result="failure",
+            status_code=404,
+        )
         raise ApiError(404, "NOT_FOUND", "资源不存在")
     request_id = request.state.request_id
     await _audit(
