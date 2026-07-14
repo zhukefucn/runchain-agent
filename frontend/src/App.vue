@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { useRouter } from "vue-router";
 import { roleName, useAuthStore } from "@/stores/auth";
+import BrandLockup from "@/components/BrandLockup.vue";
 
 const auth = useAuthStore();
 const router = useRouter();
@@ -14,7 +15,7 @@ async function logout() {
   <RouterView v-if="$route.path === '/login'" />
   <div v-else class="app-frame">
     <header class="topbar">
-      <div class="brand-lockup"><span class="brand-mark">R</span><div><strong>RunChain</strong><small>多租户智能体平台</small></div></div>
+      <BrandLockup subtitle="多租户智能体平台" />
       <div class="identity" v-if="auth.principal">
         <span class="environment"><i></i> Windows DEMO</span>
         <span class="role-pill">{{ roleName[auth.principal.role] }}</span>
