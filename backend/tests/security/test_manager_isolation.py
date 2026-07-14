@@ -260,26 +260,37 @@ def test_audit_details_are_recursively_sanitized_and_metadata_only(tmp_path):
             result="denied",
             request_id="request-1",
             details={
-                "operation": "skill.invoke",
+                "operation": "invoke",
                 "status": "denied",
                 "status_code": 403,
                 "duration_ms": 12.5,
                 "count": 2,
                 "retryable": False,
+                "enabled": True,
+                "role": "manager",
+                "transport": "stdio",
                 "metrics": {
                     "count": 2,
                     "duration_ms": 12.5,
                     "status": UnsafeObject(),
                     "prompt": "nested do not store",
+                    "中文正文作为键": 99,
                 },
                 "operations": [
                     {
-                        "operation": "runner.execute",
+                        "operation": "execute",
                         "status": "failed",
                         "output": "nested do not store",
                     },
+                    {
+                        "operation": "execute",
+                        "status": "account_6222020202020202020",
+                        "error_code": "客户密码是八个八",
+                    },
                     {"set value do not store"},
                 ],
+                "error_code": "客户密码是八个八",
+                "正文：客户密码是八个八": "value",
                 "prompt": "plain prompt do not store",
                 "attachment": "plain attachment do not store",
                 "input_data": {"status": "must redact whole unknown container"},
@@ -306,42 +317,36 @@ def test_audit_details_are_recursively_sanitized_and_metadata_only(tmp_path):
         assert record.request_id == "request-1"
         assert record.created_at is not None
         assert record.details == {
-            "operation": "skill.invoke",
+            "operation": "invoke",
             "status": "denied",
             "status_code": 403,
             "duration_ms": 12.5,
             "count": 2,
             "retryable": False,
+            "enabled": True,
+            "role": "manager",
+            "transport": "stdio",
             "metrics": {
                 "count": 2,
                 "duration_ms": 12.5,
-                "status": "[REDACTED]",
-                "prompt": "[REDACTED]",
             },
             "operations": [
                 {
-                    "operation": "runner.execute",
+                    "operation": "execute",
                     "status": "failed",
-                    "output": "[REDACTED]",
                 },
-                "[REDACTED]",
+                {"operation": "execute"},
             ],
-            "prompt": "[REDACTED]",
-            "attachment": "[REDACTED]",
-            "input_data": "[REDACTED]",
-            "output": "[REDACTED]",
-            "unknown_set": "[REDACTED]",
-            "unknown_object": "[REDACTED]",
-            "message_body": "[REDACTED]",
-            "nested": "[REDACTED]",
-            "file_content": "[REDACTED]",
-            "binary_attachment": "[REDACTED]",
-            "note": "[REDACTED]",
         }
         stored = await db.scalar(select(AuditRecordRow).where(AuditRecordRow.id == record.id))
         serialized = str(stored.details)
         assert "do not store" not in serialized
         assert "custom object" not in serialized
         assert "must redact" not in serialized
+        assert "account_622" not in serialized
+        assert "客户密码" not in serialized
+        assert "中文正文作为键" not in serialized
+        assert "prompt" not in record.details
+        assert "error_code" not in record.details
 
     asyncio.run(_with_repositories(tmp_path, check))

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-from collections.abc import Mapping, Sequence
 from math import isfinite
 from typing import Any
 
@@ -10,104 +8,111 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import AuditRecordRow
 
 
-_REDACTED = "[REDACTED]"
-_SENSITIVE_TOKENS = {
-    "authorization",
-    "body",
-    "content",
-    "cookie",
-    "credential",
-    "key",
-    "message",
-    "password",
-    "payload",
-    "secret",
-    "token",
-}
-_SENSITIVE_VALUE = re.compile(
-    r"(?i)(?:\b(?:authorization|api[_-]?key|password|secret|token)\b\s*[:=]"
-    r"|\bbearer\s+[a-z0-9._~+/-]+)"
-)
-_SAFE_ENUM_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$")
-
 # Fail-closed audit metadata schema. Add a field here only after establishing
 # that it cannot contain manager business content or credentials.
-_ALLOWED_SCALAR_FIELDS: dict[str, tuple[type, ...]] = {
-    "count": (int,),
-    "duration_ms": (int, float),
-    "enabled": (bool,),
-    "error_code": (str,),
-    "operation": (str,),
-    "reason_code": (str,),
-    "retryable": (bool,),
-    "role": (str,),
-    "status": (str,),
-    "status_code": (int, str),
-    "transport": (str,),
+_ALLOWED_ENUM_FIELDS: dict[str, frozenset[str]] = {
+    "operation": frozenset(
+        {
+            "authorize",
+            "connect",
+            "create",
+            "delete",
+            "disconnect",
+            "execute",
+            "install",
+            "invoke",
+            "list",
+            "login",
+            "logout",
+            "read",
+            "revoke",
+            "update",
+        }
+    ),
+    "role": frozenset({"manager", "business_admin", "system_admin"}),
+    "status": frozenset(
+        {
+            "active",
+            "allowed",
+            "approved",
+            "cancelled",
+            "completed",
+            "denied",
+            "disabled",
+            "enabled",
+            "failed",
+            "failure",
+            "inactive",
+            "not_found",
+            "pending",
+            "rejected",
+            "running",
+            "success",
+        }
+    ),
+    "transport": frozenset({"stdio", "http", "sse", "mock"}),
 }
-_ALLOWED_MAPPING_FIELDS = {"metrics"}
-_ALLOWED_SEQUENCE_FIELDS = {"operations"}
+_ALLOWED_BOOL_FIELDS = frozenset({"enabled", "retryable"})
+_ALLOWED_NUMERIC_FIELDS: dict[str, tuple[tuple[type, ...], float, float]] = {
+    "count": ((int,), 0, 1_000_000_000),
+    "duration_ms": ((int, float), 0, 86_400_000),
+    "status_code": ((int,), 100, 599),
+}
+_METRIC_FIELDS = frozenset({"count", "duration_ms"})
+_OPERATION_FIELDS = frozenset({"operation", "status", "count", "duration_ms"})
+_ROOT_FIELDS = frozenset(_ALLOWED_ENUM_FIELDS).union(
+    _ALLOWED_BOOL_FIELDS, _ALLOWED_NUMERIC_FIELDS
+)
 
 
-def _key_tokens(key: object) -> set[str]:
-    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key)).lower()
-    return {token for token in re.split(r"[^a-z0-9]+", text) if token}
+def _sanitize_fields(value: Any, allowed_fields: frozenset[str]) -> dict[str, Any]:
+    if type(value) is not dict:
+        return {}
+    sanitized: dict[str, Any] = {}
+    for key, item in value.items():
+        if type(key) is not str or key not in allowed_fields:
+            continue
+        if key in _ALLOWED_ENUM_FIELDS:
+            if type(item) is str and item in _ALLOWED_ENUM_FIELDS[key]:
+                sanitized[key] = item
+            continue
+        if key in _ALLOWED_BOOL_FIELDS:
+            if type(item) is bool:
+                sanitized[key] = item
+            continue
+        if key in _ALLOWED_NUMERIC_FIELDS:
+            types, minimum, maximum = _ALLOWED_NUMERIC_FIELDS[key]
+            if type(item) in types and minimum <= item <= maximum:
+                if type(item) is not float or isfinite(item):
+                    sanitized[key] = item
+    return sanitized
 
 
-def _is_sensitive_key(key: object) -> bool:
-    tokens = _key_tokens(key)
-    return bool(tokens & _SENSITIVE_TOKENS) or "apikey" in "".join(tokens)
-
-
-def _sanitize_scalar(key: str, value: Any) -> Any:
-    allowed_types = _ALLOWED_SCALAR_FIELDS[key]
-    if type(value) not in allowed_types:
-        return _REDACTED
-    if isinstance(value, str):
-        if _SENSITIVE_VALUE.search(value) or not _SAFE_ENUM_VALUE.fullmatch(value):
-            return _REDACTED
-    if isinstance(value, float) and not isfinite(value):
-        return _REDACTED
-    return value
-
-
-def _sanitize_mapping(value: Any) -> dict[str, Any] | str:
-    if not isinstance(value, Mapping):
-        return _REDACTED
-    if any(not isinstance(key, str) for key in value):
-        return _REDACTED
-    return {key: _sanitize_field(key, item) for key, item in value.items()}
-
-
-def _sanitize_sequence(value: Any) -> list[Any] | str:
-    if (
-        isinstance(value, (str, bytes, bytearray, memoryview, set, frozenset))
-        or not isinstance(value, Sequence)
-        or len(value) > 50
-    ):
-        return _REDACTED
-    return [
-        _sanitize_mapping(item) if isinstance(item, Mapping) else _REDACTED
+def _sanitize_operations(value: Any) -> list[dict[str, Any]]:
+    if type(value) not in (list, tuple) or len(value) > 50:
+        return []
+    operations = [
+        _sanitize_fields(item, _OPERATION_FIELDS)
         for item in value
+        if type(item) is dict
     ]
-
-
-def _sanitize_field(key: str, value: Any) -> Any:
-    if _is_sensitive_key(key):
-        return _REDACTED
-    if key in _ALLOWED_SCALAR_FIELDS:
-        return _sanitize_scalar(key, value)
-    if key in _ALLOWED_MAPPING_FIELDS:
-        return _sanitize_mapping(value)
-    if key in _ALLOWED_SEQUENCE_FIELDS:
-        return _sanitize_sequence(value)
-    return _REDACTED
+    return [operation for operation in operations if operation]
 
 
 def sanitize_audit_details(value: Any) -> dict[str, Any]:
-    """Keep only allowlisted, low-risk metadata; redact every unknown field."""
-    sanitized = _sanitize_mapping(value)
-    return sanitized if isinstance(sanitized, dict) else {}
+    """Keep only fixed-schema, low-risk metadata; omit every unknown field."""
+    if type(value) is not dict:
+        return {}
+    sanitized = _sanitize_fields(value, _ROOT_FIELDS)
+    if "metrics" in value:
+        metrics = _sanitize_fields(value["metrics"], _METRIC_FIELDS)
+        if metrics:
+            sanitized["metrics"] = metrics
+    if "operations" in value:
+        operations = _sanitize_operations(value["operations"])
+        if operations:
+            sanitized["operations"] = operations
+    return sanitized
 
 
 class AuditRepository:
