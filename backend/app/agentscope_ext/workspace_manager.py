@@ -133,8 +133,8 @@ class ManagerLocalWorkspaceManager(WorkspaceManagerBase):
     """AgentScope local workspace manager with manager-owner isolation.
 
     AgentScope's native local workspace is per-agent. Accordingly, sessions
-    for one manager/agent share the agent workspace while AgentScope stores
-    their individual context below ``sessions/<session_id>``. The owner id is
+    for one manager/agent share the agent workspace while this demo manager
+    provisions their individual context below ``sessions/<session_id>``. The owner id is
     included in both the cache key and filesystem path.
 
     Filesystem checks reduce link/junction escape risk, but local filesystem
