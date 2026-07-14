@@ -124,8 +124,8 @@ export const useChatStore = defineStore("chat", () => {
 
   async function send(prompt: string) {
     await stopActive();
+    if (!currentId.value) await create(`新接待任务 ${sessions.value.length + 1}`);
     const sessionId = currentId.value;
-    if (!sessionId) return;
     const state = stateFor(sessionId);
     state.messages.push({ id: `local-${Date.now()}`, role: "user", content: prompt });
     state.liveText = "";

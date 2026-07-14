@@ -7,6 +7,37 @@ import { useChatStore } from "@/stores/chat";
 import FinalPlan from "@/components/FinalPlan.vue";
 
 describe("manager workspace", () => {
+  it("creates the first session automatically when the manager sends from an empty workspace", async () => {
+    const requests: Array<{ url: string; body?: unknown }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      requests.push({ url, body });
+      if (url.endsWith("/api/manager/sessions")) {
+        return jsonResponse({ id: "s-new", title: "新接待任务 1", status: "active", agent_id: "reception-leader" });
+      }
+      if (url.endsWith("/chat")) {
+        return sseResponse([
+          'data: {"type":"token","request_id":"req-new","session_id":"s-new","run_id":"r-new","data":{"text":"收到"}}\n\n',
+        ]);
+      }
+      throw new Error(`unexpected ${url}`);
+    }));
+    const { pinia } = createTestingApp({ username: "manager0001", role: "manager", authenticated: true });
+    const store = useChatStore(pinia);
+
+    await store.send("请安排接待");
+
+    expect(requests.map((request) => request.url)).toEqual([
+      "/api/manager/sessions",
+      "/api/manager/sessions/s-new/chat",
+    ]);
+    expect(requests[0].body).toEqual({ title: "新接待任务 1", agent_id: "reception-leader" });
+    expect(requests[1].body).toEqual({ prompt: "请安排接待" });
+    expect(store.currentId).toBe("s-new");
+    expect(store.assistantText).toBe("收到");
+  });
+
   it("renders operational plan fields without internal owner or AgentScope IDs", () => {
     render(FinalPlan, {
       props: {
