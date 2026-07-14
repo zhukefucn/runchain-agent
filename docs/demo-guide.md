@@ -106,7 +106,7 @@ ZIP 必须保留单一 Skill 根目录，不能只压缩根目录内的散文件
 
 | 日期 | 环境 | 结果 | 操作者 | 备注 |
 |---|---|---|---|---|
-| 2026-07-14 | Windows 本机 / Chromium | 通过 | Codex（Playwright 实际浏览器） | 11 步全链路通过；StepFun 真实模型 Smoke 独立通过 |
+| 2026-07-14 | Windows 本机 / Chromium | 通过 | Codex（人工浏览器复验 + Playwright） | 干净启动后人工确认：manager 初始会话为空，创建并完成主管/接站/住宿/餐饮协作、工具轨迹、HITL 审批与最终方案；公开界面无 `team:` worker、owner 或 AgentScope 内部 ID，760px 执行详情抽屉可用。Playwright 另行覆盖四账号、Skill 上传发布授权、本机 MCP、两个 manager 正常执行及相互隔离；StepFun 真实模型 Smoke 独立通过。 |
 
 ## 常见问题
 
