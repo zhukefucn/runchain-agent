@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os
-import time
+from datetime import datetime
 from typing import Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -25,16 +24,16 @@ def plan_pickup(
         "南京南站",
         "南京站",
         "南京禄口国际机场",
-        "测试超时站",
-        "测试崩溃站",
     ],
     guest_count: Annotated[int, Field(ge=1, le=50)],
 ) -> dict[str, object]:
     """Return a deterministic mock pickup plan for a supported Nanjing station."""
-    if station == "测试超时站":
-        time.sleep(0.5)
-    if station == "测试崩溃站":
-        os._exit(91)
+    try:
+        parsed_arrival = datetime.fromisoformat(arrival_time.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("arrival_time must be a valid ISO timestamp") from exc
+    if parsed_arrival.tzinfo is None or parsed_arrival.utcoffset() is None:
+        raise ValueError("arrival_time must include a timezone offset")
     return {
         "mock": True,
         "arrival_time": arrival_time,

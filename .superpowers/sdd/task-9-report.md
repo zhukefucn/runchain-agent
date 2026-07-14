@@ -57,3 +57,43 @@ No network, randomness, or model call is used.
 
 The eight warnings in the full suite are pre-existing AgentScope storage
 deprecation warnings outside Task 9.
+
+## Review remediation
+
+The post-implementation review identified lifecycle ownership and generation
+races. The corrected architecture now has an explicitly injected,
+application-scoped `McpRuntimeRegistry` with a fixed namespace, canonical
+root/Python fingerprint, shared call limit, hard running-server limit, and a
+composite `(namespace, server_id, config_fingerprint)` runtime identity.
+Request-scoped `McpService.aclose()` never stops shared processes; only registry
+`shutdown_all()` / `aclose()` owns application process teardown.
+
+Every start re-reads and integrity-checks the database before consulting the
+registry. Spawn slots are reserved atomically before process creation and are
+released by compare-and-remove on start failure, stop, timeout, cancellation,
+protocol failure, idle crash, or shutdown. Runtime generations prevent stale
+calls and late task exits from overwriting a newer running/stopped state.
+Lifecycle exit notification uses the registry-owned session factory and writes
+failed state plus audit in one short transaction. A heartbeat detects an idle
+stdio subprocess exit even when no request is active.
+
+Business tool calls are now restricted to active, explicitly authorized
+managers; global administrators only govern and probe servers. `call_tool` has
+one audit exit path, including denied, unavailable, validation, SDK, timeout,
+protocol, output-bound, and cancelled paths. Cancellation releases the shared
+semaphore, compare-retires the uncertain MCP session, completes one shielded
+short audit task, and then propagates `CancelledError`.
+
+Production `mock_pickup_server.py` contains no crash or sleep test hooks. Fault
+injection lives only under `backend/tests/fixtures/`. Arrival timestamps are
+parsed with `datetime.fromisoformat` and must be valid and timezone-aware. Raw
+path components are checked for symlinks/reparse points before resolution and
+containment/hash validation.
+
+Review-remediation verification:
+
+- Task-specific plus schema/setup contracts: `30 passed`
+- Full suite: `253 passed, 2 skipped`
+- `python -m compileall -q backend`: passed
+- `python -m pip check`: no broken requirements
+- `git diff --check`: passed (normal Windows LF/CRLF notices only)

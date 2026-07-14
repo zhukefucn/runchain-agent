@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any
+from uuid import uuid4
 
 from jsonschema import Draft202012Validator, FormatChecker
 from mcp import ClientSession, StdioServerParameters
@@ -61,9 +62,19 @@ def _is_reparse(path: Path) -> bool:
     )
 
 
+def _reject_reparse_chain(path: Path) -> None:
+    raw = path.absolute()
+    for component in reversed((raw, *raw.parents)):
+        if component.exists() and _is_reparse(component):
+            raise McpValidationError("path contains a symlink or reparse point")
+
+
 @dataclass(slots=True)
 class _Runtime:
+    key: "RuntimeKey"
     parameters: StdioServerParameters
+    actor_user_id: str
+    generation: str = field(default_factory=lambda: str(uuid4()))
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     stop_requested: asyncio.Event = field(default_factory=asyncio.Event)
     session: ClientSession | None = None
@@ -71,7 +82,9 @@ class _Runtime:
     failure: BaseException | None = None
     tools: dict[str, Any] = field(default_factory=dict)
 
-    async def run(self) -> None:
+    intentional_stop: bool = False
+
+    async def run_protocol(self) -> None:
         try:
             async with stdio_client(self.parameters) as (read, write):
                 async with ClientSession(read, write) as session:
@@ -80,25 +93,171 @@ class _Runtime:
                     listed = await session.list_tools()
                     self.tools = {tool.name: tool for tool in listed.tools}
                     self.ready.set()
-                    await self.stop_requested.wait()
+                    while not self.stop_requested.is_set():
+                        try:
+                            await asyncio.wait_for(
+                                self.stop_requested.wait(), timeout=0.2
+                            )
+                        except asyncio.TimeoutError:
+                            await asyncio.wait_for(session.send_ping(), timeout=0.5)
         except BaseException as exc:
             self.failure = exc
             self.ready.set()
-            raise
         finally:
             self.session = None
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeKey:
+    namespace: str
+    server_id: str
+    config_fingerprint: str
+
+
 @dataclass(slots=True)
 class McpRuntimeRegistry:
-    """Process-local lifecycle state shared by request-scoped services."""
+    """Application-scoped owner of all MCP runtimes and process cleanup."""
 
-    runtimes: dict[str, _Runtime] = field(default_factory=dict)
-    locks: dict[str, asyncio.Lock] = field(default_factory=dict)
-    call_slots: asyncio.Semaphore | None = None
+    application_namespace: str
+    server_root: Path
+    python_executable: Path
+    session_factory: async_sessionmaker[AsyncSession]
+    max_calls: int = 4
+    max_running_servers: int = 2
+    allowed_server_scripts: frozenset[str] = frozenset({"mock_pickup_server.py"})
+    runtimes: dict[RuntimeKey, _Runtime] = field(default_factory=dict, init=False)
+    locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
+    call_slots: asyncio.Semaphore = field(init=False)
+    _global_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    _config_fingerprint: str = field(init=False)
+    _notifications: set[asyncio.Task[None]] = field(default_factory=set, init=False)
+
+    def __post_init__(self) -> None:
+        if not self.application_namespace or self.max_calls < 1 or self.max_running_servers < 1:
+            raise ValueError("invalid MCP runtime registry configuration")
+        _reject_reparse_chain(self.server_root)
+        _reject_reparse_chain(self.python_executable)
+        self.server_root = self.server_root.resolve(strict=True)
+        self.python_executable = self.python_executable.resolve(strict=True)
+        self.call_slots = asyncio.Semaphore(self.max_calls)
+        material = "\0".join(
+            (
+                self.application_namespace,
+                os.path.normcase(str(self.server_root)),
+                os.path.normcase(str(self.python_executable)),
+                _sha256(self.python_executable),
+                str(self.max_calls),
+                str(self.max_running_servers),
+                *sorted(self.allowed_server_scripts),
+            )
+        )
+        self._config_fingerprint = hashlib.sha256(material.encode()).hexdigest()
 
     def lock(self, server_id: str) -> asyncio.Lock:
         return self.locks.setdefault(server_id, asyncio.Lock())
+
+    @property
+    def config_fingerprint(self) -> str:
+        return self._config_fingerprint
+
+    async def current(self, server_id: str) -> _Runtime | None:
+        async with self._global_lock:
+            return next(
+                (runtime for key, runtime in self.runtimes.items() if key.server_id == server_id),
+                None,
+            )
+
+    async def reserve(self, runtime: _Runtime) -> None:
+        async with self._global_lock:
+            current = next(
+                (item for key, item in self.runtimes.items() if key.server_id == runtime.key.server_id),
+                None,
+            )
+            if current is not None:
+                raise McpConflictError("an MCP runtime already exists for this server")
+            if len(self.runtimes) >= self.max_running_servers:
+                raise McpUnavailableError("MCP running-server limit reached")
+            self.runtimes[runtime.key] = runtime
+            runtime.task = asyncio.create_task(
+                self._run(runtime), name=f"mcp-{runtime.key.server_id}-{runtime.generation}"
+            )
+
+    async def _run(self, runtime: _Runtime) -> None:
+        await runtime.run_protocol()
+        notification = asyncio.create_task(self._on_exit(runtime))
+        self._notifications.add(notification)
+        notification.add_done_callback(self._notification_done)
+
+    def _notification_done(self, task: asyncio.Task[None]) -> None:
+        self._notifications.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    async def _on_exit(self, runtime: _Runtime) -> None:
+        async with self.lock(runtime.key.server_id):
+            removed = await self.compare_remove(runtime)
+            if not removed or runtime.intentional_stop:
+                return
+            async with self.session_factory() as db:
+                row = await db.get(McpServerRow, runtime.key.server_id)
+                if row is None:
+                    return
+                row.status = "failed"
+                row.last_error = "PROCESS_EXITED"
+                AuditRepository(db).add_pending(
+                    actor_user_id=runtime.actor_user_id,
+                    action="mcp.lifecycle",
+                    resource_type="mcp_server",
+                    resource_id=row.id,
+                    result="failure",
+                    request_id=None,
+                    details={"operation": "disconnect", "status": "failure"},
+                )
+                await db.commit()
+
+    async def compare_remove(self, runtime: _Runtime) -> bool:
+        async with self._global_lock:
+            if self.runtimes.get(runtime.key) is not runtime:
+                return False
+            del self.runtimes[runtime.key]
+            return True
+
+    async def retire(self, runtime: _Runtime) -> bool:
+        removed = await self.compare_remove(runtime)
+        if not removed:
+            return False
+        runtime.intentional_stop = True
+        await _stop_runtime_process(runtime)
+        return True
+
+    async def shutdown_all(self) -> None:
+        async with self._global_lock:
+            runtimes = list(self.runtimes.values())
+            self.runtimes.clear()
+            for runtime in runtimes:
+                runtime.intentional_stop = True
+        await asyncio.gather(
+            *(_stop_runtime_process(runtime) for runtime in runtimes),
+            return_exceptions=True,
+        )
+        if self._notifications:
+            await asyncio.gather(*tuple(self._notifications), return_exceptions=True)
+
+    async def aclose(self) -> None:
+        await self.shutdown_all()
+
+
+async def _stop_runtime_process(runtime: _Runtime) -> None:
+    runtime.stop_requested.set()
+    if runtime.task is None or runtime.task is asyncio.current_task():
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(runtime.task), timeout=5)
+    except asyncio.TimeoutError:
+        runtime.task.cancel()
+        await asyncio.gather(runtime.task, return_exceptions=True)
+    except BaseException:
+        pass
 
 
 class McpService:
@@ -108,31 +267,38 @@ class McpService:
         self,
         db: AsyncSession,
         *,
+        runtime_registry: McpRuntimeRegistry,
+        application_namespace: str,
         server_root: Path,
         python_executable: Path,
         start_timeout: float = 10.0,
         call_timeout: float = 10.0,
         max_input_bytes: int = 16 * 1024,
         max_output_bytes: int = 64 * 1024,
-        max_concurrent_calls: int = 4,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
-        runtime_registry: McpRuntimeRegistry | None = None,
         allowed_server_scripts: frozenset[str] = frozenset({"mock_pickup_server.py"}),
     ) -> None:
-        self._sessions = session_factory or async_sessionmaker(
-            db.bind, expire_on_commit=False
-        )
+        _reject_reparse_chain(server_root)
+        _reject_reparse_chain(python_executable)
+        self._sessions = session_factory or runtime_registry.session_factory
         self._root = server_root.resolve(strict=True)
         self._python = python_executable.resolve(strict=True)
+        if (
+            application_namespace != runtime_registry.application_namespace
+            or self._root != runtime_registry.server_root
+            or self._python != runtime_registry.python_executable
+            or allowed_server_scripts != runtime_registry.allowed_server_scripts
+            or self._sessions is not runtime_registry.session_factory
+        ):
+            raise ValueError("MCP service configuration does not match its application registry")
+        self._namespace = application_namespace
         self._start_timeout = start_timeout
         self._call_timeout = call_timeout
         self._max_input_bytes = max_input_bytes
         self._max_output_bytes = max_output_bytes
         self._allowed_server_scripts = allowed_server_scripts
-        self._registry = runtime_registry or McpRuntimeRegistry()
+        self._registry = runtime_registry
         self._runtimes = self._registry.runtimes
-        if self._registry.call_slots is None:
-            self._registry.call_slots = asyncio.Semaphore(max_concurrent_calls)
         self._calls = self._registry.call_slots
 
     @staticmethod
@@ -156,6 +322,7 @@ class McpService:
         if type(command) is not str or not Path(command).is_absolute():
             raise McpValidationError("command must be the canonical Python executable")
         try:
+            _reject_reparse_chain(Path(command))
             executable = Path(command).resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             raise McpValidationError("invalid command") from exc
@@ -171,6 +338,7 @@ class McpService:
         if relative.name not in self._allowed_server_scripts:
             raise McpValidationError("server script is not allowlisted")
         try:
+            _reject_reparse_chain(self._root / relative)
             script = (self._root / relative).resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             raise McpValidationError("server script does not exist") from exc
@@ -288,6 +456,8 @@ class McpService:
         ):
             raise McpConflictError("stored server configuration violates policy")
         try:
+            _reject_reparse_chain(Path(command))
+            _reject_reparse_chain(script_path)
             executable = Path(command).resolve(strict=True)
             script = script_path.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
@@ -298,17 +468,34 @@ class McpService:
             raise McpConflictError("registered MCP file integrity mismatch")
         return executable, script
 
+    def _runtime_key(self, row: McpServerRow) -> RuntimeKey:
+        material = json.dumps(
+            {
+                "registry": self._registry.config_fingerprint,
+                "configuration": row.configuration,
+                "executable_sha256": row.executable_sha256,
+                "script_sha256": row.script_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return RuntimeKey(
+            self._namespace,
+            row.id,
+            hashlib.sha256(material).hexdigest(),
+        )
+
     async def start(self, actor: Principal, server_id: str) -> None:
         self._require_admin(actor)
         async with self._lock(server_id):
-            current = self._runtimes.get(server_id)
-            if current is not None and current.task is not None and not current.task.done():
-                return
             async with self._sessions() as db:
                 row = await self._get(db, server_id)
             try:
                 executable, script = self._verify_integrity(row)
             except BaseException:
+                current = await self._registry.current(server_id)
+                if current is not None:
+                    await self._registry.retire(current)
                 await self._record_state_audit(
                     actor=actor,
                     server_id=server_id,
@@ -319,21 +506,40 @@ class McpService:
                     details={"operation": "connect", "status": "failure"},
                 )
                 raise
+            key = self._runtime_key(row)
+            current = await self._registry.current(server_id)
+            if current is not None:
+                if current.key != key:
+                    raise McpConflictError("running MCP configuration differs from the database")
+                if current.task is not None and not current.task.done() and current.session is not None:
+                    return
+                raise McpUnavailableError("existing MCP runtime is not ready")
             runtime = _Runtime(
+                key,
                 StdioServerParameters(
                     command=str(executable), args=[str(script)], env={}, cwd=str(self._root)
-                )
+                ),
+                actor.user_id,
             )
-            runtime.task = asyncio.create_task(runtime.run(), name=f"mcp-{server_id}")
-            runtime.task.add_done_callback(self._consume_runtime_exception)
-            self._runtimes[server_id] = runtime
+            try:
+                await self._registry.reserve(runtime)
+            except McpUnavailableError:
+                await self._record_state_audit(
+                    actor=actor,
+                    server_id=server_id,
+                    status="failed",
+                    error_code="START_LIMIT",
+                    action="mcp.start",
+                    result="failure",
+                    details={"operation": "connect", "status": "failure"},
+                )
+                raise
             try:
                 await asyncio.wait_for(runtime.ready.wait(), timeout=self._start_timeout)
                 if runtime.failure is not None or runtime.session is None:
                     raise McpUnavailableError("MCP server failed to initialize")
             except BaseException:
-                await self._stop_runtime(runtime)
-                self._runtimes.pop(server_id, None)
+                await self._registry.retire(runtime)
                 await self._record_state_audit(
                     actor=actor,
                     server_id=server_id,
@@ -380,31 +586,17 @@ class McpService:
             )
             await db.commit()
 
-    @staticmethod
-    def _consume_runtime_exception(task: asyncio.Task[None]) -> None:
-        if not task.cancelled():
-            task.exception()
-
     async def _stop_runtime(self, runtime: _Runtime) -> None:
-        runtime.stop_requested.set()
-        if runtime.task is None:
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(runtime.task), timeout=5)
-        except asyncio.TimeoutError:
-            runtime.task.cancel()
-            await asyncio.gather(runtime.task, return_exceptions=True)
-        except BaseException:
-            pass
+        await self._registry.retire(runtime)
 
     async def stop(self, actor: Principal, server_id: str) -> None:
         self._require_admin(actor)
         async with self._lock(server_id):
             async with self._sessions() as db:
                 await self._get(db, server_id)
-            runtime = self._runtimes.pop(server_id, None)
+            runtime = await self._registry.current(server_id)
             if runtime is not None:
-                await self._stop_runtime(runtime)
+                await self._registry.retire(runtime)
             await self._record_state_audit(
                 actor=actor,
                 server_id=server_id,
@@ -419,7 +611,7 @@ class McpService:
         self._require_admin(actor)
         async with self._sessions() as db:
             await self._get(db, server_id)
-        runtime = self._runtimes.get(server_id)
+        runtime = await self._registry.current(server_id)
         healthy = bool(
             runtime is not None
             and runtime.task is not None
@@ -440,7 +632,7 @@ class McpService:
         async with self._sessions() as db:
             await self._get(db, server_id)
         try:
-            runtime = self._active_runtime(server_id)
+            runtime = await self._active_runtime(server_id)
         except McpUnavailableError:
             await self._audit_operation(
                 actor, server_id, "mcp.list_tools", "list", "failure", count=0
@@ -484,8 +676,8 @@ class McpService:
             )
             await db.commit()
 
-    def _active_runtime(self, server_id: str) -> _Runtime:
-        runtime = self._runtimes.get(server_id)
+    async def _active_runtime(self, server_id: str) -> _Runtime:
+        runtime = await self._registry.current(server_id)
         if (
             runtime is None
             or runtime.task is None
@@ -497,8 +689,6 @@ class McpService:
 
     @staticmethod
     async def _can_call(db: AsyncSession, actor: Principal, server_id: str) -> bool:
-        if actor.role in _ADMIN_ROLES:
-            return True
         if actor.role != Role.MANAGER:
             return False
         return bool(
@@ -521,67 +711,86 @@ class McpService:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
-        async with self._sessions() as db:
-            await self._get(db, server_id)
-            can_call = await self._can_call(db, actor, server_id)
-        if not can_call:
-            await self._audit_call(actor, server_id, "denied")
-            raise McpPermissionError("MCP tool is not authorized")
-        runtime = self._active_runtime(server_id)
-        tool = runtime.tools.get(tool_name)
-        if tool is None:
-            await self._audit_call(actor, server_id, "failure")
-            raise McpValidationError("tool was not advertised by the MCP server")
-        if type(arguments) is not dict:
-            await self._audit_call(actor, server_id, "failure")
-            raise McpValidationError("tool arguments must be an object")
+        result = "failure"
+        runtime: _Runtime | None = None
+        retire_code: str | None = None
         try:
+            async with self._sessions() as db:
+                await self._get(db, server_id)
+                can_call = await self._can_call(db, actor, server_id)
+            if not can_call:
+                result = "denied"
+                raise McpPermissionError("MCP tool is not authorized")
+            runtime = await self._active_runtime(server_id)
+            tool = runtime.tools.get(tool_name)
+            if tool is None:
+                raise McpValidationError("tool was not advertised by the MCP server")
+            if type(arguments) is not dict:
+                raise McpValidationError("tool arguments must be an object")
             encoded_input = json.dumps(
                 arguments, ensure_ascii=False, separators=(",", ":")
             ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            await self._audit_call(actor, server_id, "failure")
-            raise McpValidationError("tool input must be JSON serializable") from exc
-        if len(encoded_input) > self._max_input_bytes:
-            await self._audit_call(actor, server_id, "failure")
-            raise McpValidationError("tool input exceeded the configured limit")
-        declared = tool.inputSchema.get("properties", {})
-        if type(declared) is not dict or set(arguments).difference(declared):
-            await self._audit_call(actor, server_id, "failure")
-            raise McpValidationError("tool arguments contain undeclared fields")
-        validator = Draft202012Validator(tool.inputSchema, format_checker=FormatChecker())
-        errors = sorted(validator.iter_errors(arguments), key=lambda item: list(item.path))
-        if errors:
-            await self._audit_call(actor, server_id, "failure")
-            raise McpValidationError("tool arguments do not match the advertised schema")
-        async with self._calls:
-            try:
+            if len(encoded_input) > self._max_input_bytes:
+                raise McpValidationError("tool input exceeded the configured limit")
+            declared = tool.inputSchema.get("properties", {})
+            if type(declared) is not dict or set(arguments).difference(declared):
+                raise McpValidationError("tool arguments contain undeclared fields")
+            validator = Draft202012Validator(
+                tool.inputSchema, format_checker=FormatChecker()
+            )
+            errors = sorted(
+                validator.iter_errors(arguments), key=lambda item: list(item.path)
+            )
+            if errors:
+                raise McpValidationError(
+                    "tool arguments do not match the advertised schema"
+                )
+            async with self._calls:
                 assert runtime.session is not None
-                response = await asyncio.wait_for(
-                    runtime.session.call_tool(tool_name, arguments), timeout=self._call_timeout
+                try:
+                    response = await asyncio.wait_for(
+                        runtime.session.call_tool(tool_name, arguments),
+                        timeout=self._call_timeout,
+                    )
+                except asyncio.TimeoutError as exc:
+                    retire_code = "CALL_TIMEOUT"
+                    raise McpUnavailableError("MCP tool call timed out") from exc
+                except asyncio.CancelledError:
+                    result = "cancelled"
+                    retire_code = "CALL_CANCELLED"
+                    raise
+                except BaseException:
+                    retire_code = "CALL_FAILED"
+                    raise
+            if response.isError:
+                raise McpValidationError("MCP tool rejected the request")
+            output = response.structuredContent
+            if type(output) is not dict:
+                retire_code = "PROTOCOL_FAILED"
+                raise McpUnavailableError(
+                    "MCP tool did not return a structured object"
                 )
-            except asyncio.TimeoutError as exc:
+            try:
+                encoded = json.dumps(
+                    output, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                retire_code = "PROTOCOL_FAILED"
+                raise McpUnavailableError("MCP tool returned invalid JSON") from exc
+            if len(encoded) > self._max_output_bytes:
+                raise McpUnavailableError(
+                    "MCP tool output exceeded the configured limit"
+                )
+            result = "success"
+            return output
+        except (TypeError, ValueError) as exc:
+            raise McpValidationError("tool input must be JSON serializable") from exc
+        finally:
+            if retire_code is not None and runtime is not None:
                 await self._retire_failed_runtime(
-                    actor, server_id, runtime, "CALL_TIMEOUT"
+                    actor, server_id, runtime, retire_code
                 )
-                raise McpUnavailableError("MCP tool call timed out") from exc
-            except BaseException:
-                await self._retire_failed_runtime(
-                    actor, server_id, runtime, "CALL_FAILED"
-                )
-                raise
-        if response.isError:
-            await self._audit_call(actor, server_id, "failure")
-            raise McpValidationError("MCP tool rejected the request")
-        output = response.structuredContent
-        if type(output) is not dict:
-            raise McpUnavailableError("MCP tool did not return a structured object")
-        encoded = json.dumps(output, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if len(encoded) > self._max_output_bytes:
-            await self._audit_call(actor, server_id, "failure")
-            raise McpUnavailableError("MCP tool output exceeded the configured limit")
-        await self._audit_call(actor, server_id, "success")
-        return output
+            await self._audit_call_uncancellable(actor, server_id, result)
 
     async def _retire_failed_runtime(
         self,
@@ -591,18 +800,17 @@ class McpService:
         error_code: str,
     ) -> None:
         async with self._lock(server_id):
-            if self._runtimes.get(server_id) is runtime:
-                self._runtimes.pop(server_id, None)
-                await self._stop_runtime(runtime)
-            await self._record_state_audit(
-                actor=actor,
-                server_id=server_id,
-                status="failed",
-                error_code=error_code,
-                action="mcp.call",
-                result="failure",
-                details={"operation": "invoke", "status": "failure"},
-            )
+            removed = await self._registry.retire(runtime)
+            if removed:
+                await self._record_state_audit(
+                    actor=actor,
+                    server_id=server_id,
+                    status="failed",
+                    error_code=error_code,
+                    action="mcp.lifecycle",
+                    result="failure",
+                    details={"operation": "disconnect", "status": "failure"},
+                )
 
     async def _audit_call(self, actor: Principal, server_id: str, result: str) -> None:
         async with self._sessions() as db:
@@ -617,10 +825,21 @@ class McpService:
             )
             await db.commit()
 
+    async def _audit_call_uncancellable(
+        self, actor: Principal, server_id: str, result: str
+    ) -> None:
+        task = asyncio.create_task(self._audit_call(actor, server_id, result))
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+        task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
     async def aclose(self) -> None:
-        runtimes = list(self._runtimes.values())
-        self._runtimes.clear()
-        await asyncio.gather(
-            *(self._stop_runtime(runtime) for runtime in runtimes),
-            return_exceptions=True,
-        )
+        """Release this request-scoped façade without touching app runtimes."""
+        return None
