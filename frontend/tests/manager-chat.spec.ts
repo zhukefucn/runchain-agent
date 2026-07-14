@@ -4,8 +4,30 @@ import ManagerView from "@/views/ManagerView.vue";
 import { parseSseStream } from "@/api/sse";
 import { createTestingApp, jsonResponse, sseResponse } from "./test-app";
 import { useChatStore } from "@/stores/chat";
+import FinalPlan from "@/components/FinalPlan.vue";
 
 describe("manager workspace", () => {
+  it("renders operational plan fields without internal owner or AgentScope IDs", () => {
+    render(FinalPlan, {
+      props: {
+        plan: {
+          owner: "dcdd9434-55c3-4aea-b5d4-2223c5c0a904",
+          pickup: { vehicle: "商务车", team_id: "team-secret" },
+          lodging: { hotel: "演示酒店", worker_ids: ["worker-secret"] },
+          _agentscope: {
+            team_id: "internal-team",
+            worker_ids: ["internal-worker"],
+          },
+        },
+      },
+    });
+
+    expect(screen.getByText("商务车")).toBeInTheDocument();
+    expect(screen.getByText("演示酒店")).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(
+      /dcdd9434|owner|team_id|worker_ids|team-secret|worker-secret|internal-team/,
+    );
+  });
   it("parses split SSE frames and preserves the stable event timeline", async () => {
     const response = sseResponse([
       'event: token\ndata: {"type":"token","request_id":"req-1","session_id":"s1","run_id":"r1","data":{"text":"主管已拆解任务"}}\n\n',

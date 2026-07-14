@@ -86,6 +86,15 @@ async function runReception(page: Page, username: string) {
   await expect(page.locator(".timeline")).toContainText("调用工具");
   await page.getByRole("button", { name: "确认方案" }).click();
   await expect(page.getByLabel("最终接待方案")).toBeVisible();
+  const publicSessions = await api<{ items: Array<{ title: string }> }>(
+    page,
+    "/api/manager/sessions",
+  );
+  expect(publicSessions.items.every((session) => !session.title.startsWith("team:"))).toBe(true);
+  expect((await page.locator(".session-item").allTextContents()).join(" ")).not.toContain("team:");
+  const finalPlan = page.getByLabel("最终接待方案");
+  await expect(finalPlan).not.toContainText(principal.user_id);
+  await expect(finalPlan).not.toContainText(/team_id|worker_ids|_agentscope/);
   return { principal, sessionId };
 }
 

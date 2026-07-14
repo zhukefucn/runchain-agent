@@ -15,7 +15,7 @@ def _source(name: str) -> str:
     return (SCRIPTS / name).read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("name", ["start.ps1", "stop.ps1", "test.ps1"])
+@pytest.mark.parametrize("name", ["start.ps1", "stop.ps1", "reset-demo.ps1", "test.ps1"])
 def test_lifecycle_script_is_valid_powershell(name: str) -> None:
     script = SCRIPTS / name
     command = (
@@ -104,6 +104,18 @@ def test_stop_refuses_a_forged_pid_record(tmp_path: Path) -> None:
     )
     assert completed.returncode != 0
     assert "identity" in (completed.stdout + completed.stderr).lower()
+
+
+def test_reset_is_project_scoped_and_preserves_configuration_and_fixtures() -> None:
+    source = _source("reset-demo.ps1").lower()
+    assert "stop.ps1" in source
+    assert "getfullpath" in source and "test-containedpath" in source
+    for target in ("data\\demo.db", "workspace", "skills", "runner", ".run\\e2e"):
+        assert target in source
+    assert "demo-skills" in source
+    assert "remove-item -literalpath" in source
+    assert "remove-item .env" not in source
+    assert "get-childitem" not in source
 
 
 def test_test_script_runs_every_offline_gate_and_keeps_real_model_opt_in() -> None:

@@ -43,6 +43,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\stop.ps1
 
 脚本只停止 `.run/` 中记录的本 DEMO 进程。
 
+需要恢复到初始演示数据时，可执行下面的可选命令，再重新启动：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\reset-demo.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\start.ps1 -SkipSetup
+```
+
+重置脚本先按进程身份记录安全停止本 DEMO，只清除项目内的 SQLite、manager 工作区、已安装 Skill、Runner 与 E2E 运行状态；不会删除 `.env` 或 `demo-skills/` 源码夹具。
+
 ## 测试
 
 离线完整测试使用确定性 Fake Model，不依赖外部模型服务：

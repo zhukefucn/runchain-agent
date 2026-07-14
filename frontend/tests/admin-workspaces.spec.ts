@@ -27,6 +27,26 @@ it("business admin uploads a local ZIP and publishes a skill", async () => {
   expect(fetchMock).toHaveBeenCalledWith("/api/business/skills/upload", expect.objectContaining({ body: file }));
 });
 
+it("business admin cannot submit a second mutation while one is pending", async () => {
+  let finishUpload!: (response: Response) => void;
+  const pendingUpload = new Promise<Response>((resolve) => { finishUpload = resolve; });
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/skills/upload")) return pendingUpload;
+    return jsonResponse({ items: [] });
+  }));
+  const { pinia } = createTestingApp({ username: "business_admin01", role: "business_admin", authenticated: true });
+  render(BusinessAdminView, { global: { plugins: [pinia] } });
+  const file = new File(["zip"], "pending.zip", { type: "application/zip" });
+  await userEvent.upload(screen.getByLabelText("选择 Skill ZIP"), file);
+  const install = screen.getByRole("button", { name: "安装 Skill" });
+  await fireEvent.click(install);
+  expect(install).toBeDisabled();
+  expect(screen.getByLabelText("选择 Skill ZIP")).toBeDisabled();
+  finishUpload(jsonResponse({ id: "skill-pending", name: "pending", version: "1.0.0", status: "draft", type: "python" }, 201));
+  await screen.findByText("pending");
+});
+
 it("business admin shows tools returned by an MCP connectivity test", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);

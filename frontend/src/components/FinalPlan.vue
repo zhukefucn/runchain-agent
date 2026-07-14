@@ -7,20 +7,25 @@ const labels: Record<string, string> = {
   vehicle: "车辆", time: "时间", route: "路线", hotel: "酒店",
   rooms: "房间", restaurant: "餐厅", menu: "餐饮偏好",
 };
-const ignored = new Set(["status", "decision"]);
+const ignored = new Set([
+  "status", "decision", "owner", "owner_user_id", "team_id", "worker_ids",
+  "agent_id", "session_id", "run_id", "request_id",
+]);
+function isPublicKey(key: string) { return !key.startsWith("_") && !ignored.has(key); }
 const sections = computed(() => {
   if (!props.plan || typeof props.plan !== "object" || Array.isArray(props.plan)) return [];
-  return Object.entries(props.plan as Record<string, unknown>).filter(([key]) => !ignored.has(key));
+  return Object.entries(props.plan as Record<string, unknown>).filter(([key]) => isPublicKey(key));
 });
 function title(key: string) { return labels[key] || key; }
 function fields(value: unknown) {
   return value && typeof value === "object" && !Array.isArray(value)
-    ? Object.entries(value as Record<string, unknown>).filter(([key]) => !ignored.has(key))
+    ? Object.entries(value as Record<string, unknown>).filter(([key]) => isPublicKey(key))
     : [["detail", value] as [string, unknown]];
 }
-function display(value: unknown) {
+function display(value: unknown): string {
   if (Array.isArray(value)) return value.join("、");
-  if (value && typeof value === "object") return Object.values(value as Record<string, unknown>).join(" · ");
+  if (value && typeof value === "object") return Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => isPublicKey(key)).map(([, detail]) => display(detail)).join(" · ");
   return value == null ? "—" : String(value);
 }
 </script>

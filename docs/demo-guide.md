@@ -110,6 +110,8 @@ ZIP 必须保留单一 Skill 根目录，不能只压缩根目录内的散文件
 
 ## 常见问题
 
+- 需要从干净状态重新演示：运行 `scripts/reset-demo.ps1`，再运行 `scripts/start.ps1 -SkipSetup`。该操作仅清除本项目运行数据，保留 `.env` 与 `demo-skills/`。
+
 - `/api/ready` 不通过：先运行 `scripts/check-env.ps1`，检查端口、目录权限、SQLite、Runner 能力和模型变量。
 - Skill ZIP 被拒绝：确认 ZIP 内只有一个根目录，根下直接包含 UTF-8 `SKILL.md`、合法 `skill.json` 和 manifest 声明的入口文件。
 - MCP 登记失败：命令必须是当前 `.venv` Python 的规范化绝对路径，参数只能是 allowlist 中的 `mock_pickup_server.py`，环境变量必须为空。

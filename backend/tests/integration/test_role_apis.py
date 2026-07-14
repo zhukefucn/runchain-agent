@@ -99,6 +99,48 @@ def test_public_role_matrix_is_exact_and_uses_unified_errors(
     asyncio.run(scenario())
 
 
+def test_public_manager_sessions_hide_internal_agentscope_workers(tmp_path):
+    async def scenario():
+        async with _client(tmp_path) as (client, app):
+            headers = await _auth(client, "manager0001")
+            created = await client.post(
+                "/api/manager/sessions",
+                headers=headers,
+                json={"title": "public reception", "agent_id": "reception-leader"},
+            )
+            response = await client.post(
+                f"/api/manager/sessions/{created.json()['id']}/chat",
+                headers=headers,
+                json={"prompt": "安排接站、住宿和餐饮"},
+            )
+            assert response.status_code == 200
+
+            async with app.state.session_factory() as db:
+                stored = list(
+                    await db.scalars(
+                        select(SessionRecordRow).where(
+                            SessionRecordRow.owner_user_id
+                            == (await db.scalar(
+                                select(User.id).where(User.username == "manager0001")
+                            ))
+                        )
+                    )
+                )
+            assert any(row.title.startswith("team:") for row in stored)
+
+            listed = await client.get("/api/manager/sessions", headers=headers)
+            assert listed.status_code == 200
+            assert [item["id"] for item in listed.json()["items"]] == [
+                created.json()["id"]
+            ]
+            assert all(
+                not item["title"].startswith("team:")
+                for item in listed.json()["items"]
+            )
+
+    asyncio.run(scenario())
+
+
 def test_both_managers_are_isolated_and_client_cannot_supply_owner(tmp_path):
     async def scenario():
         async with _client(tmp_path) as (client, _app):
