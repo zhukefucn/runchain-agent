@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -126,7 +127,15 @@ class HitlRequestRow(Base):
 
 class SkillRow(Base):
     __tablename__ = "skills"
-    __table_args__ = (UniqueConstraint("name", "version"),)
+    __table_args__ = (
+        UniqueConstraint("name", "version"),
+        Index(
+            "uq_skills_one_published_name",
+            "name",
+            unique=True,
+            sqlite_where=text("status = 'published'"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     created_by_user_id: Mapped[str] = mapped_column(
@@ -141,6 +150,9 @@ class SkillRow(Base):
     manifest: Mapped[dict[str, Any]] = mapped_column(JSON)
     upload_sha256: Mapped[str] = mapped_column(String(64))
     content_sha256: Mapped[str] = mapped_column(String(64))
+    skill_md_sha256: Mapped[str] = mapped_column(String(64))
+    file_sha256: Mapped[dict[str, str]] = mapped_column(JSON)
+    validation_warnings: Mapped[list[str]] = mapped_column(JSON, default=list)
     install_path: Mapped[str] = mapped_column(String(1000))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 

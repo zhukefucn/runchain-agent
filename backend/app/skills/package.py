@@ -3,16 +3,20 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import ast
 from pathlib import PurePosixPath
 import re
 import stat
 import unicodedata
 import zipfile
 
+from jsonschema import Draft202012Validator, SchemaError
+
 from app.skills.models import SkillManifest, ValidatedSkillPackage
 
 
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+MAX_ENTRIES = 128
 MAX_FILES = 128
 MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 8 * 1024 * 1024
@@ -30,7 +34,11 @@ _DEVICE_NAMES = {
     *(f"com{i}" for i in range(1, 10)),
     *(f"lpt{i}" for i in range(1, 10)),
 }
-_MANIFEST_FIELDS = {"id", "name", "version", "type", "entrypoint", "description"}
+_MANIFEST_FIELDS = {
+    "id", "name", "version", "type", "entrypoint", "description", "parameters"
+}
+_ALLOWED_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+_WINDOWS_INVALID = set('<>"|?*')
 
 
 class SkillPackageError(ValueError):
@@ -57,6 +65,8 @@ def _safe_member_parts(name: str) -> tuple[str, ...]:
             raise SkillPackageError("unsafe path uses non-canonical Unicode")
         if part.endswith((".", " ")) or ":" in part:
             raise SkillPackageError("unsafe path in ZIP member")
+        if any(character in _WINDOWS_INVALID or ord(character) < 32 for character in part):
+            raise SkillPackageError("unsafe path contains Windows-invalid characters")
         stem = part.split(".", 1)[0].casefold()
         if stem in _DEVICE_NAMES:
             raise SkillPackageError("unsafe path uses Windows device name")
@@ -66,6 +76,8 @@ def _safe_member_parts(name: str) -> tuple[str, ...]:
 def _check_member_type(info: zipfile.ZipInfo) -> None:
     if info.flag_bits & 0x1:
         raise SkillPackageError("encrypted ZIP members are not supported")
+    if info.compress_type not in _ALLOWED_COMPRESSION:
+        raise SkillPackageError("unsupported ZIP compression method")
     if info.create_system != 3:
         return
     mode = info.external_attr >> 16
@@ -140,10 +152,53 @@ def _parse_manifest(raw: bytes, files: dict[str, bytes]) -> SkillManifest:
     description = value.get("description", "")
     if type(description) is not str or len(description) > 1000:
         raise SkillPackageError("manifest description is invalid")
+    parameters = value.get("parameters", {"type": "object", "properties": {}})
+    if type(parameters) is not dict:
+        raise SkillPackageError("manifest parameters must be a JSON Schema object")
+    try:
+        Draft202012Validator.check_schema(parameters)
+    except SchemaError as exc:
+        raise SkillPackageError("manifest parameters is not a valid JSON Schema") from exc
     return SkillManifest(
         id=value["id"], name=name, version=value["version"], type=skill_type,
-        entrypoint=entrypoint, description=description,
+        entrypoint=entrypoint, description=description, parameters=parameters,
     )
+
+
+def _python_warnings(source: bytes) -> tuple[str, ...]:
+    try:
+        tree = ast.parse(source.decode("utf-8"))
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise SkillPackageError("python entrypoint has invalid syntax or encoding") from exc
+    dangerous_imports = {"os", "subprocess", "socket", "ctypes", "winreg"}
+    dangerous_calls = {"eval", "exec", "compile", "__import__", "open"}
+    warnings: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root in dangerous_imports:
+                    warnings.add(f"dangerous_import:{root}")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            root = node.module.split(".", 1)[0]
+            if root in dangerous_imports:
+                warnings.add(f"dangerous_import:{root}")
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in dangerous_calls:
+                warnings.add(f"dangerous_call:{node.func.id}")
+    return tuple(sorted(warnings))
+
+
+def canonical_content_sha256(files: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        encoded_name = name.encode("utf-8")
+        content = files[name]
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
 
 
 def validate_skill_zip(
@@ -158,6 +213,8 @@ def validate_skill_zip(
 
     with archive:
         infos = archive.infolist()
+        if len(infos) > MAX_ENTRIES:
+            raise SkillPackageError("too many ZIP entries in Skill package")
         aliases: set[str] = set()
         raw_names: set[str] = set()
         file_paths: set[tuple[str, ...]] = set()
@@ -190,7 +247,8 @@ def validate_skill_zip(
                 raise SkillPackageError("compression ratio is too high")
         if len(roots) != 1 or not file_infos:
             raise SkillPackageError("Skill ZIP must contain one root directory")
-        for path in file_paths:
+        all_paths = file_paths | directory_paths
+        for path in all_paths:
             if any(path[:index] in file_paths for index in range(1, len(path))):
                 raise SkillPackageError("file and directory paths conflict")
             if path in directory_paths:
@@ -229,16 +287,17 @@ def validate_skill_zip(
     except UnicodeDecodeError as exc:
         raise SkillPackageError("SKILL.md must be UTF-8 text") from exc
     manifest = _parse_manifest(files["skill.json"], files)
-    canonical = hashlib.sha256()
-    for name in sorted(files):
-        canonical.update(name.encode("utf-8"))
-        canonical.update(b"\0")
-        canonical.update(files[name])
-        canonical.update(b"\0")
+    warnings = _python_warnings(files[manifest.entrypoint]) if manifest.type == "python" else ()
+    file_sha256 = {
+        name: hashlib.sha256(content).hexdigest() for name, content in files.items()
+    }
     return ValidatedSkillPackage(
         manifest=manifest,
         root=root,
         files=files,
         upload_sha256=hashlib.sha256(upload).hexdigest(),
-        content_sha256=canonical.hexdigest(),
+        content_sha256=canonical_content_sha256(files),
+        skill_md_sha256=file_sha256["SKILL.md"],
+        file_sha256=file_sha256,
+        warnings=warnings,
     )

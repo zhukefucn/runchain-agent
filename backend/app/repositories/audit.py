@@ -121,6 +121,30 @@ class AuditRepository:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
 
+    def add_pending(
+        self,
+        *,
+        actor_user_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str | None,
+        result: str,
+        request_id: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> AuditRecordRow:
+        """Add sanitized audit metadata to the caller's current transaction."""
+        row = AuditRecordRow(
+            actor_user_id=actor_user_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            result=result,
+            request_id=request_id,
+            details=sanitize_audit_details(details or {}),
+        )
+        self._db.add(row)
+        return row
+
     async def record(
         self,
         *,
@@ -132,16 +156,16 @@ class AuditRepository:
         request_id: str | None,
         details: dict[str, Any] | None = None,
     ) -> AuditRecordRow:
-        row = AuditRecordRow(
+        """Backward-compatible convenience method that owns its transaction."""
+        row = self.add_pending(
             actor_user_id=actor_user_id,
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,
             result=result,
             request_id=request_id,
-            details=sanitize_audit_details(details or {}),
+            details=details,
         )
-        self._db.add(row)
         await self._db.commit()
         await self._db.refresh(row)
         return row

@@ -13,6 +13,7 @@ dependencies = [
     "argon2-cffi==25.1.0",
     "fastapi==0.139.0",
     "PyJWT==2.13.0",
+    "jsonschema==4.26.0",
     "pydantic-settings==2.10.1",
     "APScheduler==3.11.3",
     "ag-ui-protocol==0.1.19",

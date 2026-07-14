@@ -25,7 +25,18 @@ class SkillRepository:
         await self.db.flush()
         return row
 
-    async def retire_published_versions(self, name: str, except_id: str) -> None:
+    async def retire_published_versions(self, name: str, except_id: str) -> list[str]:
+        retired_ids = list(
+            await self.db.scalars(
+                select(SkillRow.id).where(
+                    SkillRow.name == name,
+                    SkillRow.status == "published",
+                    SkillRow.id != except_id,
+                )
+            )
+        )
+        if not retired_ids:
+            return []
         await self.db.execute(
             update(SkillRow)
             .where(
@@ -34,6 +45,19 @@ class SkillRepository:
                 SkillRow.id != except_id,
             )
             .values(status="draft")
+        )
+        await self.db.execute(
+            delete(SkillAuthorizationRow).where(
+                SkillAuthorizationRow.skill_id.in_(retired_ids)
+            )
+        )
+        return retired_ids
+
+    async def revoke_all(self, skill_id: str) -> None:
+        await self.db.execute(
+            delete(SkillAuthorizationRow).where(
+                SkillAuthorizationRow.skill_id == skill_id
+            )
         )
 
     async def manager_is_active(self, user_id: str) -> bool:

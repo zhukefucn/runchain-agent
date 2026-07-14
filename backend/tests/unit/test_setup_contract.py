@@ -69,3 +69,10 @@ def test_agentscope_service_dependencies_are_exactly_pinned():
     for pin in required_pins:
         assert f'"{pin}"' in pyproject
         assert pin in lock_lines
+
+
+def test_skill_manifest_schema_validator_is_exactly_pinned():
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text()
+    lock_lines = (PROJECT_ROOT / "requirements.lock").read_text().splitlines()
+    assert '"jsonschema==4.26.0"' in pyproject
+    assert "jsonschema==4.26.0" in lock_lines

@@ -7,7 +7,12 @@ import zipfile
 
 import pytest
 
-from app.skills.package import SkillPackageError, validate_skill_zip
+from app.skills.package import (
+    MAX_ENTRIES,
+    SkillPackageError,
+    canonical_content_sha256,
+    validate_skill_zip,
+)
 
 
 def skill_zip(
@@ -22,6 +27,11 @@ def skill_zip(
         "type": "python",
         "entrypoint": "main.py",
         "description": "demo",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "additionalProperties": False,
+        },
     }
     members: dict[str, bytes | str] = {
         "private-demo/SKILL.md": "# Private demo",
@@ -46,6 +56,8 @@ def test_valid_skill_zip_returns_manifest_files_and_upload_hash():
     assert package.root == "private-demo"
     assert set(package.files) == {"SKILL.md", "skill.json", "main.py"}
     assert len(package.upload_sha256) == 64
+    assert len(package.skill_md_sha256) == 64
+    assert package.manifest.parameters["type"] == "object"
 
 
 @pytest.mark.parametrize(
@@ -61,6 +73,9 @@ def test_valid_skill_zip_returns_manifest_files_and_upload_hash():
         "root/file.txt:stream",
         "root/CON.txt",
         "root/trailing. ",
+        "root/bad?.py",
+        "root/bad|name.py",
+        "root/control\x1f.py",
     ],
 )
 def test_unsafe_zip_paths_are_rejected(member):
@@ -119,6 +134,42 @@ def test_manifest_fields_and_entrypoint_are_strict(change):
     manifest.update(change)
     with pytest.raises(SkillPackageError):
         validate_skill_zip(skill_zip(manifest=manifest))
+
+
+def test_manifest_rejects_unknown_fields_and_invalid_parameter_schema():
+    base = {
+        "id": "private-demo", "name": "private-demo", "version": "1.0.0",
+        "type": "python", "entrypoint": "main.py",
+    }
+    with pytest.raises(SkillPackageError, match="invalid fields"):
+        validate_skill_zip(skill_zip(manifest={**base, "unknown": True}))
+    with pytest.raises(SkillPackageError, match="parameters"):
+        validate_skill_zip(skill_zip(manifest={**base, "parameters": {"type": 123}}))
+
+
+def test_python_entrypoint_is_parsed_without_execution_and_warnings_are_structured():
+    upload = skill_zip({
+        "private-demo/SKILL.md": "# Demo",
+        "private-demo/skill.json": json.dumps({
+            "id": "private-demo", "name": "private-demo", "version": "1.0.0",
+            "type": "python", "entrypoint": "main.py",
+        }),
+        "private-demo/main.py": "import os\nvalue = eval('1')\n",
+    })
+    package = validate_skill_zip(upload)
+    assert "dangerous_import:os" in package.warnings
+    assert "dangerous_call:eval" in package.warnings
+
+    broken = skill_zip({
+        "private-demo/SKILL.md": "# Demo",
+        "private-demo/skill.json": json.dumps({
+            "id": "private-demo", "name": "private-demo", "version": "1.0.0",
+            "type": "python", "entrypoint": "main.py",
+        }),
+        "private-demo/main.py": "def broken(",
+    })
+    with pytest.raises(SkillPackageError, match="syntax"):
+        validate_skill_zip(broken)
 
 
 def test_prompt_skill_requires_skill_md_entrypoint_and_mcp_requires_json_entrypoint():
@@ -190,3 +241,38 @@ def test_streaming_limits_reject_high_ratio_and_large_content():
     huge = "0" * (2 * 1024 * 1024)
     with pytest.raises(SkillPackageError, match="compression ratio|too large"):
         validate_skill_zip(skill_zip({"root/SKILL.md": huge, "root/skill.json": "{}"}))
+
+
+def test_entry_limit_counts_directories_and_file_directory_ancestor_conflicts():
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for index in range(MAX_ENTRIES + 1):
+            archive.writestr(f"root/empty-{index}/", b"")
+    with pytest.raises(SkillPackageError, match="entries"):
+        validate_skill_zip(output.getvalue())
+
+    conflict = skill_zip({
+        "root/a": "file",
+        "root/a/b/": b"",
+        "root/SKILL.md": "# x",
+        "root/skill.json": "{}",
+    })
+    with pytest.raises(SkillPackageError, match="conflict"):
+        validate_skill_zip(conflict)
+
+
+def test_unsupported_compression_is_a_domain_error():
+    upload = bytearray(skill_zip())
+    local = upload.index(b"PK\x03\x04")
+    central = upload.index(b"PK\x01\x02")
+    upload[local + 8:local + 10] = (99).to_bytes(2, "little")
+    upload[central + 10:central + 12] = (99).to_bytes(2, "little")
+    with pytest.raises(SkillPackageError, match="compression"):
+        validate_skill_zip(upload)
+
+
+def test_canonical_hash_uses_unambiguous_length_prefixes():
+    # The old `path + NUL + content + NUL` framing collides for these maps.
+    left = {"a": b"b\x00c", "d": b"e"}
+    right = {"a": b"b", "c\x00d": b"e"}
+    assert canonical_content_sha256(left) != canonical_content_sha256(right)
