@@ -29,7 +29,10 @@ from app.agents.reception import ReceptionTeamRuntime, reception_subagent_templa
 from app.agentscope_ext.sqlite_storage import SQLiteStorage
 from app.agentscope_ext.workspace_manager import ManagerLocalWorkspaceManager
 from app.api.auth import router as auth_router
+from app.api.business import router as business_router
 from app.api.health import router as health_router
+from app.api.manager import router as manager_router
+from app.api.system import router as system_router
 from app.auth.security import decode_access_token
 from app.auth.deps import get_session, get_settings as auth_get_settings
 from app.config import Settings
@@ -283,6 +286,9 @@ def create_root_app(
     install_error_handlers(app)
     app.include_router(auth_router)
     app.include_router(health_router)
+    app.include_router(manager_router)
+    app.include_router(business_router)
+    app.include_router(system_router)
 
     async def local_session():
         async with sessions() as db:
