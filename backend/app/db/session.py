@@ -38,6 +38,8 @@ async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 
 async def create_schema(target_engine: AsyncEngine | None = None) -> None:
+    from app.db import models  # noqa: F401
+
     schema_engine = target_engine or engine
     async with schema_engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)

@@ -1,4 +1,9 @@
 import asyncio
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
 
 from argon2 import PasswordHasher
 from sqlalchemy import UniqueConstraint, inspect, select, text
@@ -43,6 +48,7 @@ OWNER_MODELS = (
     WorkspaceFileRow,
     SkillInvocationRow,
 )
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 async def _with_database(tmp_path, check):
@@ -107,3 +113,38 @@ def test_seed_creates_four_hashed_users_and_is_idempotent(tmp_path):
         )
 
     asyncio.run(_with_database(tmp_path, check))
+
+
+def test_create_schema_registers_models_without_caller_imports(tmp_path):
+    database_path = tmp_path / "clean-import.db"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "DATABASE_URL": f"sqlite+aiosqlite:///{database_path}",
+            "JWT_SECRET_KEY": "subprocess-test-only",
+            "MODEL_API_KEY": "subprocess-test-only",
+            "PYTHONPATH": str(PROJECT_ROOT / "backend"),
+        }
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import asyncio; from app.db.session import create_schema; "
+            "asyncio.run(create_schema())",
+        ],
+        check=True,
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    with sqlite3.connect(database_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert tables == EXPECTED_TABLES
