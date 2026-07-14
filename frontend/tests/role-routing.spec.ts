@@ -1,6 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/vue";
-import { createTestingApp } from "./test-app";
+import { createTestingApp, jsonResponse } from "./test-app";
 import { expect, it } from "vitest";
+import { apiRequest } from "@/api/client";
+import { vi } from "vitest";
 
 const cases = [
   ["manager0001", "manager", "/manager"],
@@ -29,4 +31,14 @@ it("blocks a manager from navigating to either admin workspace", async () => {
   await router.isReady();
   expect(router.currentRoute.value.path).toBe("/manager");
   expect(auth.principal?.role).toBe("manager");
+});
+
+it("clears the complete auth session and returns to login on API 401", async () => {
+  const { router, auth } = createTestingApp({ username: "manager0001", role: "manager", authenticated: true });
+  await router.push("/manager");
+  vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ code: "TOKEN_INVALID", message: "expired" }, 401)));
+  await expect(apiRequest("/api/manager/sessions")).rejects.toThrow("expired");
+  await waitFor(() => expect(router.currentRoute.value.path).toBe("/login"));
+  expect(auth.principal).toBeNull();
+  expect(localStorage.getItem("runchain_token")).toBeNull();
 });

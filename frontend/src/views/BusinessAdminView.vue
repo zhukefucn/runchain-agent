@@ -4,18 +4,20 @@ import { apiRequest } from "@/api/client";
 import SkillUpload from "@/components/SkillUpload.vue";
 
 type Skill = { id: string; name: string; version: string; type: string; status: string; description?: string; validation_warnings?: string[] };
-type Mcp = { id: string; name: string; transport: string; status: string; last_error?: string };
+type McpTool = { name: string; description?: string };
+type Mcp = { id: string; name: string; transport: string; status: string; last_error?: string; tools?: McpTool[] };
 type Invocation = { id: string; skill_id: string; owner_user_id: string; session_id: string; status: string; created_at?: string };
 const skills = ref<Skill[]>([]); const mcps = ref<Mcp[]>([]); const invocations = ref<Invocation[]>([]);
-const active = ref<"skills" | "mcp" | "invocations">("skills"); const error = ref("");
+const active = ref<"skills" | "mcp" | "invocations">("skills"); const error = ref(""); const busy = ref("");
 const managerIds = ref<Record<string, string>>({});
 const mcpForm = ref({ name: "", command: "", args: "" });
 async function load() { try { const [s, m, i] = await Promise.all([apiRequest<{items: Skill[]}>("/api/business/skills"), apiRequest<{items: Mcp[]}>("/api/business/mcp-servers"), apiRequest<{items: Invocation[]}>("/api/business/skill-invocations")]); skills.value=s.items; mcps.value=m.items; invocations.value=i.items; } catch (cause) { error.value=cause instanceof Error?cause.message:"加载失败"; } }
-async function upload(file: File) { const row=await apiRequest<Skill>("/api/business/skills/upload", { method:"POST", headers:{"Content-Type":file.type||"application/zip"}, body:file }); skills.value.push(row); }
-async function mutate(skill: Skill, action: "publish"|"disable") { const row=await apiRequest<Skill>(`/api/business/skills/${skill.id}/${action}`, {method:"POST"}); Object.assign(skill,row); }
-async function authorize(skill: Skill) { const manager_user_id=managerIds.value[skill.id]?.trim(); if(!manager_user_id)return; await apiRequest(`/api/business/skills/${skill.id}/authorizations`, {method:"POST",body:JSON.stringify({manager_user_id})}); managerIds.value[skill.id]=""; }
-async function registerMcp() { const row=await apiRequest<Mcp>("/api/business/mcp-servers", {method:"POST",body:JSON.stringify({name:mcpForm.value.name,command:mcpForm.value.command,args:mcpForm.value.args.split(/\s+/).filter(Boolean),env:{}})}); mcps.value.push(row); mcpForm.value={name:"",command:"",args:""}; }
-async function testMcp(server: Mcp) { const result=await apiRequest<{healthy:boolean}>(`/api/business/mcp-servers/${server.id}/test`, {method:"POST"}); server.status=result.healthy?"healthy":"unavailable"; }
+async function run(key: string, action: () => Promise<void>) { error.value=""; busy.value=key; try { await action(); } catch (cause) { error.value=cause instanceof Error?cause.message:"操作失败"; } finally { busy.value=""; } }
+async function upload(file: File) { await run("upload", async()=>{ const row=await apiRequest<Skill>("/api/business/skills/upload", { method:"POST", headers:{"Content-Type":file.type||"application/zip"}, body:file }); skills.value.push(row); }); }
+async function mutate(skill: Skill, action: "publish"|"disable") { await run(`skill-${skill.id}`, async()=>{ const row=await apiRequest<Skill>(`/api/business/skills/${skill.id}/${action}`, {method:"POST"}); Object.assign(skill,row); }); }
+async function authorize(skill: Skill) { const manager_user_id=managerIds.value[skill.id]?.trim(); if(!manager_user_id)return; await run(`auth-${skill.id}`, async()=>{ await apiRequest(`/api/business/skills/${skill.id}/authorizations`, {method:"POST",body:JSON.stringify({manager_user_id})}); managerIds.value[skill.id]=""; }); }
+async function registerMcp() { await run("register-mcp", async()=>{ const row=await apiRequest<Mcp>("/api/business/mcp-servers", {method:"POST",body:JSON.stringify({name:mcpForm.value.name,command:mcpForm.value.command,args:mcpForm.value.args.split(/\s+/).filter(Boolean),env:{}})}); mcps.value.push(row); mcpForm.value={name:"",command:"",args:""}; }); }
+async function testMcp(server: Mcp) { await run(`mcp-${server.id}`, async()=>{ const result=await apiRequest<{healthy:boolean;tools?:McpTool[]}>(`/api/business/mcp-servers/${server.id}/test`, {method:"POST"}); server.status=result.healthy?"healthy":"unavailable"; server.tools=result.tools??[]; }); }
 onMounted(load);
 </script>
 <template>
@@ -25,5 +27,9 @@ onMounted(load);
       <template v-else-if="active==='mcp'"><section class="form-card"><h2>登记本地 MCP Server</h2><div class="form-grid three"><label>显示名称<input v-model="mcpForm.name" placeholder="mock-reception"/></label><label>命令<input v-model="mcpForm.command" placeholder="python"/></label><label>参数<input v-model="mcpForm.args" placeholder="scripts/mock_mcp.py"/></label></div><button class="button primary" @click="registerMcp">登记 Server</button></section><section class="data-card"><div class="card-title"><h2>Server 列表</h2><span>{{mcps.length}} 项</span></div><div v-for="server in mcps" :key="server.id" class="server-row"><span class="server-icon">⌘</span><div><strong>{{server.name}}</strong><small>{{server.transport}} · {{server.status}}</small></div><button class="button secondary compact" @click="testMcp(server)">测试连接</button></div><p v-if="!mcps.length" class="table-empty">暂无 MCP Server</p></section></template>
       <template v-else><section class="data-card"><div class="card-title"><h2>最近调用</h2><span>仅元数据</span></div><div class="table-wrap"><table><thead><tr><th>Skill ID</th><th>客户经理</th><th>会话</th><th>状态</th><th>时间</th></tr></thead><tbody><tr v-for="row in invocations" :key="row.id"><td>{{row.skill_id}}</td><td>{{row.owner_user_id}}</td><td>{{row.session_id}}</td><td><span class="tag published">{{row.status}}</span></td><td>{{row.created_at||'—'}}</td></tr><tr v-if="!invocations.length"><td colspan="5" class="table-empty">暂无调用记录</td></tr></tbody></table></div></section></template>
     </section>
+    <div class="operation-feedback" aria-live="polite">
+      <template v-for="skill in skills" :key="`warnings-${skill.id}`"><p v-for="warning in skill.validation_warnings" :key="warning" class="alert warning">{{ warning }}</p></template>
+      <template v-for="server in mcps" :key="`tools-${server.id}`"><span v-for="tool in server.tools" :key="tool.name" class="tag published"><strong>{{ tool.name }}</strong><small v-if="tool.description">{{ tool.description }}</small></span></template>
+    </div>
   </main>
 </template>

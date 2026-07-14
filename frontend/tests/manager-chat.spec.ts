@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import ManagerView from "@/views/ManagerView.vue";
 import { parseSseStream } from "@/api/sse";
 import { createTestingApp, jsonResponse, sseResponse } from "./test-app";
+import { useChatStore } from "@/stores/chat";
 
 describe("manager workspace", () => {
   it("parses split SSE frames and preserves the stable event timeline", async () => {
@@ -15,6 +16,16 @@ describe("manager workspace", () => {
     for await (const event of parseSseStream(response)) events.push(event);
     expect(events.map((event) => event.type)).toEqual(["token", "tool_call", "hitl_pending"]);
     expect(events[1].data.agent_type).toBe("pickup");
+  });
+
+  it("parses CRLF and multiline data when delimiters split across chunks", async () => {
+    const payload = '{"type":"run_started","request_id":"req-2","session_id":"s2","run_id":"r2",\n"data":{}}';
+    const wire = `: heartbeat\r\nevent: run_started\r\ndata: ${payload.split("\n")[0]}\r\ndata: ${payload.split("\n")[1]}\r\n\r\n`;
+    const response = sseResponse([...wire]);
+    const events = [];
+    for await (const event of parseSseStream(response)) events.push(event);
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("run_started");
   });
 
   it("sends only prompt authority data, renders timeline, and confirms HITL", async () => {
@@ -52,5 +63,50 @@ describe("manager workspace", () => {
     expect(chat?.body).toEqual({ prompt: "请安排周五晚到站的三位客人" });
     expect(chat?.headers.get("Authorization")).toBe("Bearer test-token");
     expect(JSON.stringify(requests)).not.toMatch(/owner_user_id|user_id|\"role\"/);
+    await fireEvent.click(screen.getByRole("button", { name: "执行详情" }));
+    expect(screen.getByRole("complementary", { name: "执行详情" })).toHaveClass("mobile-open");
+  });
+
+  it("reconstructs a persisted pending HITL event and human transcript", async () => {
+    const terminal = { type: "hitl_pending", request_id: "req-p", session_id: "s1", run_id: "r1", data: { request_id: "hitl-p", summary: { pickup: { vehicle: "商务车" } } } };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/sessions")) return jsonResponse({ items: [{ id: "s1", title: "持久会话", status: "active", agent_id: "reception-leader" }] });
+      if (url.endsWith("/messages")) return jsonResponse({ items: [{ id: "m1", session_id: "s1", role: "user", content: "安排接待" }, { id: "m2", session_id: "s1", role: "assistant", content: JSON.stringify(terminal) }] });
+      if (url.endsWith("/skills") || url.endsWith("/files")) return jsonResponse({ items: [] });
+      throw new Error(url);
+    }));
+    const { pinia } = createTestingApp({ username: "manager0001", role: "manager", authenticated: true });
+    render(ManagerView, { global: { plugins: [pinia] } });
+    await screen.findByText("安排接待");
+    expect(screen.getByText("接待方案已汇总，等待你的确认。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "确认方案" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["confirm", "approve", "方案已确认"],
+    ["cancel", "reject", "方案已取消"],
+    ["modify", "modification", "修改意见已提交"],
+  ] as const)("consumes %s HITL response events", async (decision, wireDecision, label) => {
+    const terminal = { type: "hitl_pending", request_id: "req-p", session_id: "s1", run_id: "r1", data: { request_id: "hitl-p", summary: {} } };
+    const complete = { type: "complete", request_id: "hitl-p", session_id: "s1", run_id: "r1", data: { decision: wireDecision, status: "completed", plan: { hotel: "演示酒店" } } };
+    const calls: unknown[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/sessions")) return jsonResponse({ items: [{ id: "s1", title: "持久会话", status: "active", agent_id: "reception-leader" }] });
+      if (url.endsWith("/messages")) return jsonResponse({ items: [{ id: "m2", session_id: "s1", role: "assistant", content: JSON.stringify(terminal) }] });
+      if (url.endsWith("/skills") || url.endsWith("/files")) return jsonResponse({ items: [] });
+      if (url.includes("/hitl/")) { calls.push(JSON.parse(String(init?.body))); return jsonResponse({ request_id: "hitl-p", status: "completed", events: [{ ...complete, type: "token", data: { phase: "resumed", decision: wireDecision } }, complete] }); }
+      throw new Error(url);
+    }));
+    const { pinia } = createTestingApp({ username: "manager0001", role: "manager", authenticated: true });
+    const store = useChatStore();
+    await store.load();
+    await store.decideHitl(store.hitl!, decision, decision === "modify" ? { note: "靠窗" } : null);
+    expect(calls[0]).toEqual({ decision: wireDecision, modifications: decision === "modify" ? { note: "靠窗" } : null });
+    expect(store.hitl).toBeUndefined();
+    expect(store.events[store.events.length - 1]?.type).toBe("complete");
+    expect(store.messages[store.messages.length - 1]?.content).toContain(label);
+    expect(store.finalPlan).toEqual({ hotel: "演示酒店" });
   });
 });

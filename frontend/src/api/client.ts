@@ -1,4 +1,5 @@
 const TOKEN_KEY = "runchain_token";
+let unauthorizedHandler: (() => Promise<void> | void) | undefined;
 
 export type ApiErrorPayload = { code?: string; message?: string; request_id?: string };
 
@@ -25,6 +26,15 @@ export function clearToken() {
   localStorage.removeItem(TOKEN_KEY);
 }
 
+export function setUnauthorizedHandler(handler?: () => Promise<void> | void) {
+  unauthorizedHandler = handler;
+}
+
+async function handleUnauthorized() {
+  clearToken();
+  await unauthorizedHandler?.();
+}
+
 function authorizedHeaders(headers?: HeadersInit) {
   const result = new Headers(headers);
   const token = getToken();
@@ -49,7 +59,7 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
   }
   const response = await fetch(path, { ...init, headers });
   if (!response.ok) {
-    if (response.status === 401) clearToken();
+    if (response.status === 401) await handleUnauthorized();
     throw await toApiError(response);
   }
   if (response.status === 204) return undefined as T;
@@ -61,6 +71,9 @@ export async function apiStream(path: string, init: RequestInit = {}) {
   headers.set("Accept", "text/event-stream");
   if (init.body && typeof init.body === "string") headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...init, headers });
-  if (!response.ok) throw await toApiError(response);
+  if (!response.ok) {
+    if (response.status === 401) await handleUnauthorized();
+    throw await toApiError(response);
+  }
   return response;
 }

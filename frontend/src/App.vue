@@ -4,9 +4,9 @@ import { roleName, useAuthStore } from "@/stores/auth";
 
 const auth = useAuthStore();
 const router = useRouter();
-function logout() {
-  auth.logout();
-  router.replace("/login");
+async function logout() {
+  await auth.logout();
+  await router.replace("/login");
 }
 </script>
 

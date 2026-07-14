@@ -2,7 +2,7 @@
 import type { StableEvent } from "@/api/sse";
 defineProps<{ events: StableEvent[] }>();
 const agents: Record<string, string> = { leader: "接待主管", pickup: "接站专家", lodging: "住宿专家", dining: "餐饮专家" };
-const labels: Record<string, string> = { agent_started: "开始执行", tool_call: "调用工具", tool_result: "工具返回", agent_completed: "任务完成", hitl_pending: "等待确认", complete: "执行完成", error: "执行异常" };
+const labels: Record<string, string> = { run_started: "任务已启动", agent_started: "开始执行", tool_call: "调用工具", tool_result: "工具返回", agent_completed: "任务完成", hitl_pending: "等待确认", complete: "执行完成", error: "执行异常" };
 </script>
 <template>
   <ol class="timeline" aria-label="执行时间线">

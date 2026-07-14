@@ -1,6 +1,7 @@
 import { computed, ref } from "vue";
 import { defineStore } from "pinia";
 import { apiRequest, clearToken, getToken, setToken } from "@/api/client";
+import { abortAllStreams } from "@/api/streams";
 
 export type Role = "manager" | "business_admin" | "system_admin";
 export type Principal = { user_id: string; role: Role; tenant_id: string; username?: string };
@@ -49,15 +50,20 @@ export const useAuthStore = defineStore("auth", () => {
       principal.value = await apiRequest<Principal>("/api/auth/me");
       return principal.value;
     } catch {
-      logout();
+      await logout();
       return null;
     }
   }
 
-  function logout() {
+  async function logout() {
+    await abortAllStreams();
     clearToken();
     principal.value = null;
     displayName.value = "";
+  }
+
+  async function expire() {
+    await logout();
   }
 
   function hydrateForTest(token: string, value: Principal) {
@@ -66,5 +72,5 @@ export const useAuthStore = defineStore("auth", () => {
     displayName.value = value.username || "";
   }
 
-  return { principal, displayName, loading, authenticated, login, restore, logout, hydrateForTest };
+  return { principal, displayName, loading, authenticated, login, restore, logout, expire, hydrateForTest };
 });
