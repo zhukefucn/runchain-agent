@@ -10,22 +10,31 @@ import zipfile
 import pytest
 from unittest.mock import AsyncMock
 from sqlalchemy import func, inspect, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth.models import Principal
 from app.db.models import AuditRecordRow, Role, SkillRow, User
 from app.db.seed import seed_demo_data
 from app.db.session import build_async_engine, create_schema
 from app.repositories.audit import AuditRepository
+from app.repositories.skill import SkillRepository
 from app.skills.service import (
     UNCOMMITTED_MARKER,
     EffectiveSkill,
     SkillCleanupError,
     SkillConflictError,
     SkillPermissionError,
-    SkillService,
-    runtime_skill_cache,
+    SkillService as GovernedSkillService,
 )
+from app.skills.package import MAX_FILE_BYTES
+
+
+def SkillService(db, install_root):
+    return GovernedSkillService(
+        db,
+        install_root,
+        read_session_factory=async_sessionmaker(db.bind, expire_on_commit=False),
+    )
 
 
 def package(version: str = "1.0.0", name: str = "private-demo") -> bytes:
@@ -66,21 +75,21 @@ def test_install_publish_authorize_isolate_and_invalidate_cache(tmp_path):
         assert (tmp_path / "installed" / "private-demo" / "1.0.0" / "SKILL.md").is_file()
 
         await service.publish(admin, first.id)
-        assert await service.effective_skills(users["manager0001"].id) == []
+        assert await service.effective_skills(users["manager0001"].id) == ()
         await service.authorize(admin, first.id, users["manager0001"].id)
         effective = await service.effective_skills(users["manager0001"].id)
         assert [s.name for s in effective] == ["private-demo"]
         assert isinstance(effective[0], EffectiveSkill)
         with pytest.raises(FrozenInstanceError):
             effective[0].name = "mutated"
-        assert await service.effective_skills(users["manager0002"].id) == []
+        assert await service.effective_skills(users["manager0002"].id) == ()
 
         # Prime cache, then prove a state change is visible without restart.
         await service.authorize(admin, first.id, users["manager0002"].id)
         assert [s.name for s in await service.effective_skills(users["manager0002"].id)] == ["private-demo"]
         await service.disable(admin, first.id)
-        assert await service.effective_skills(users["manager0001"].id) == []
-        assert await service.effective_skills(users["manager0002"].id) == []
+        assert await service.effective_skills(users["manager0001"].id) == ()
+        assert await service.effective_skills(users["manager0002"].id) == ()
         audits = (await db.scalars(select(AuditRecordRow))).all()
         assert {row.action for row in audits} == {
             "skill.install", "skill.publish", "skill.authorize", "skill.disable"
@@ -90,45 +99,43 @@ def test_install_publish_authorize_isolate_and_invalidate_cache(tmp_path):
     asyncio.run(scenario(tmp_path, check))
 
 
-def test_cache_is_shared_across_services_and_stale_query_cannot_refill(tmp_path):
+def test_policy_lock_serializes_independent_read_snapshot_and_disable(
+    tmp_path, monkeypatch
+):
     async def check(db, users):
         root = tmp_path / "installed"
         first_service = SkillService(db, root)
-        second_service = SkillService(db, root)
         admin = principal(users["business_admin01"])
         skill = await first_service.install(admin, package())
         await first_service.publish(admin, skill.id)
         await first_service.authorize(admin, skill.id, users["manager0001"].id)
-        assert await first_service.effective_skills(users["manager0001"].id)
-        await second_service.disable(admin, skill.id)
-        assert await first_service.effective_skills(users["manager0001"].id) == []
-
-        await first_service.publish(admin, skill.id)
-        await first_service.authorize(admin, skill.id, users["manager0001"].id)
-        await runtime_skill_cache.invalidate()
         started = asyncio.Event()
         release = asyncio.Event()
-        original = first_service._repository.effective
-        calls = 0
+        original = SkillRepository.effective
 
-        async def stale_once(user_id):
-            nonlocal calls
-            calls += 1
-            rows = await original(user_id)
-            if calls == 1:
-                started.set()
-                await release.wait()
+        async def blocked_read(repository, user_id):
+            rows = await original(repository, user_id)
+            started.set()
+            await release.wait()
             return rows
 
-        first_service._repository.effective = stale_once
-        pending = asyncio.create_task(
+        monkeypatch.setattr(SkillRepository, "effective", blocked_read)
+        snapshot_task = asyncio.create_task(
             first_service.effective_skills(users["manager0001"].id)
         )
         await started.wait()
-        await second_service.disable(admin, skill.id)
-        release.set()
-        assert await pending == []
-        assert calls == 2
+        async with AsyncSession(db.bind, expire_on_commit=False) as second_db:
+            second_service = SkillService(second_db, root)
+            disable_task = asyncio.create_task(second_service.disable(admin, skill.id))
+            await asyncio.sleep(0)
+            assert not disable_task.done()
+            release.set()
+            old_snapshot = await snapshot_task
+            assert [item.name for item in old_snapshot] == ["private-demo"]
+            await disable_task
+            monkeypatch.setattr(SkillRepository, "effective", original)
+            assert await first_service.effective_skills(users["manager0001"].id) == ()
+            assert [item.name for item in old_snapshot] == ["private-demo"]
 
     asyncio.run(scenario(tmp_path, check))
 
@@ -168,9 +175,9 @@ def test_versions_are_distinct_duplicate_is_idempotent_and_publish_switches_acti
         await db.refresh(one)
         assert one.status == "draft"
         assert two.status == "published"
-        assert await service.effective_skills(users["manager0001"].id) == []
+        assert await service.effective_skills(users["manager0001"].id) == ()
         await service.publish(admin, one.id)
-        assert await service.effective_skills(users["manager0001"].id) == []
+        assert await service.effective_skills(users["manager0001"].id) == ()
         assert len((await db.scalars(select(SkillRow))).all()) == 2
 
     asyncio.run(scenario(tmp_path, check))
@@ -259,8 +266,16 @@ def test_postcommit_marker_removal_failure_keeps_committed_row_quarantined(
         row = await db.scalar(select(SkillRow))
         assert row is not None
         assert (Path(row.install_path) / UNCOMMITTED_MARKER).is_file()
+        assert await service.effective_skills(users["manager0001"].id) == ()
         with pytest.raises(SkillConflictError, match="uncommitted"):
             await service.publish(principal(users["business_admin01"]), row.id)
+        monkeypatch.setattr(Path, "unlink", original_unlink)
+        recovered = await service.install(
+            principal(users["business_admin01"]), package()
+        )
+        assert recovered.id == row.id
+        assert not (Path(row.install_path) / UNCOMMITTED_MARKER).exists()
+        await service.publish(principal(users["business_admin01"]), row.id)
 
     from pathlib import Path
     asyncio.run(scenario(tmp_path, check))
@@ -313,6 +328,66 @@ def test_publish_rejects_uncommitted_marker(tmp_path):
         Path(skill.install_path, UNCOMMITTED_MARKER).write_text("pending")
         with pytest.raises(SkillConflictError, match="uncommitted"):
             await service.publish(admin, skill.id)
+
+    from pathlib import Path
+    asyncio.run(scenario(tmp_path, check))
+
+
+def test_disk_rescan_rejects_oversize_and_excess_entries_without_read_bytes(
+    tmp_path, monkeypatch
+):
+    async def check(db, users):
+        service = SkillService(db, tmp_path / "installed")
+        admin = principal(users["business_admin01"])
+        skill = await service.install(admin, package())
+        destination = Path(skill.install_path)
+        (destination / "main.py").write_bytes(b"x" * (MAX_FILE_BYTES + 1))
+        monkeypatch.setattr(
+            Path,
+            "read_bytes",
+            lambda _path: (_ for _ in ()).throw(AssertionError("unbounded read")),
+        )
+        with pytest.raises(SkillConflictError, match="limit"):
+            await service.publish(admin, skill.id)
+
+        (destination / "main.py").write_text("print('ok')")
+        (destination / "unexpected-empty").mkdir()
+        with pytest.raises(SkillConflictError, match="file set"):
+            await service.install(admin, package())
+        (destination / "unexpected-empty").rmdir()
+        monkeypatch.setattr("app.skills.service.MAX_ENTRIES", 2)
+        with pytest.raises(SkillConflictError, match="entries"):
+            await service.install(admin, package())
+
+    from pathlib import Path
+    asyncio.run(scenario(tmp_path, check))
+
+
+def test_disk_rescan_rejects_reparse_points_and_resolved_nested_escape(
+    tmp_path, monkeypatch
+):
+    async def check(db, users):
+        service = SkillService(db, tmp_path / "installed")
+        admin = principal(users["business_admin01"])
+        skill = await service.install(admin, package())
+
+        monkeypatch.setattr("app.skills.service._is_reparse_point", lambda _stat: True)
+        with pytest.raises(SkillConflictError, match="reparse"):
+            await service.publish(admin, skill.id)
+
+        monkeypatch.setattr("app.skills.service._is_reparse_point", lambda _stat: False)
+        original_resolve = Path.resolve
+        outside = tmp_path / "escaped-main.py"
+        outside.write_text("print('ok')")
+
+        def escaped_nested(path, *args, **kwargs):
+            if path.name == "main.py":
+                return outside
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", escaped_nested)
+        with pytest.raises(SkillConflictError, match="escapes"):
+            await service.install(admin, package())
 
     from pathlib import Path
     asyncio.run(scenario(tmp_path, check))

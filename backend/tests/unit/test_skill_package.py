@@ -60,6 +60,37 @@ def test_valid_skill_zip_returns_manifest_files_and_upload_hash():
     assert package.manifest.parameters["type"] == "object"
 
 
+def test_windows_explorer_style_explicit_directories_are_accepted():
+    output = io.BytesIO()
+    manifest = {
+        "id": "private-demo", "name": "private-demo", "version": "1.0.0",
+        "type": "python", "entrypoint": "scripts/main.py",
+    }
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("private-demo/", b"")
+        archive.writestr("private-demo/scripts/", b"")
+        archive.writestr("private-demo/SKILL.md", "# Demo")
+        archive.writestr("private-demo/skill.json", json.dumps(manifest))
+        archive.writestr("private-demo/scripts/main.py", "print('ok')")
+    assert validate_skill_zip(output.getvalue()).manifest.entrypoint == "scripts/main.py"
+
+
+def test_explicit_empty_directory_without_a_file_descendant_is_rejected():
+    output = io.BytesIO()
+    manifest = {
+        "id": "private-demo", "name": "private-demo", "version": "1.0.0",
+        "type": "python", "entrypoint": "main.py",
+    }
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("private-demo/", b"")
+        archive.writestr("private-demo/empty/", b"")
+        archive.writestr("private-demo/SKILL.md", "# Demo")
+        archive.writestr("private-demo/skill.json", json.dumps(manifest))
+        archive.writestr("private-demo/main.py", "print('ok')")
+    with pytest.raises(SkillPackageError, match="empty directory"):
+        validate_skill_zip(output.getvalue())
+
+
 @pytest.mark.parametrize(
     "member",
     [
@@ -87,6 +118,18 @@ def test_nul_in_raw_member_name_is_rejected():
     upload = skill_zip({"root/ab": "x"}).replace(b"root/ab", b"root/a\x00")
     with pytest.raises(SkillPackageError, match="unsafe path"):
         validate_skill_zip(upload)
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "root/.runchain-uncommitted",
+        "root/scripts/.runchain-uncommitted",
+    ],
+)
+def test_internal_install_marker_name_is_reserved_at_every_depth(member):
+    with pytest.raises(SkillPackageError, match="reserved"):
+        validate_skill_zip(skill_zip({member: "x"}))
 
 
 def test_windows_safe_path_length_limits_are_enforced():

@@ -58,6 +58,8 @@ def _safe_member_parts(name: str) -> tuple[str, ...]:
     if not parts or any(part in ("", ".", "..") for part in parts):
         raise SkillPackageError("unsafe path in ZIP member")
     for part in parts:
+        if part.casefold() == ".runchain-uncommitted":
+            raise SkillPackageError("reserved internal install marker name")
         if len(part) > 255:
             raise SkillPackageError("unsafe path component is too long")
         if unicodedata.normalize("NFC", part) != part:
@@ -215,7 +217,7 @@ def validate_skill_zip(
         infos = archive.infolist()
         if len(infos) > MAX_ENTRIES:
             raise SkillPackageError("too many ZIP entries in Skill package")
-        aliases: set[str] = set()
+        aliases: dict[str, bool] = {}
         raw_names: set[str] = set()
         file_paths: set[tuple[str, ...]] = set()
         directory_paths: set[tuple[str, ...]] = set()
@@ -228,11 +230,16 @@ def validate_skill_zip(
             parts = _safe_member_parts(info.filename.rstrip("/"))
             roots.add(parts[0])
             alias = "/".join(part.casefold() for part in parts)
-            if info.filename in raw_names or alias in aliases:
+            is_directory = info.is_dir()
+            if info.filename in raw_names:
+                raise SkillPackageError("duplicate ZIP member or filesystem alias")
+            if alias in aliases:
+                if aliases[alias] != is_directory:
+                    raise SkillPackageError("file and directory paths conflict")
                 raise SkillPackageError("duplicate ZIP member or filesystem alias")
             raw_names.add(info.filename)
-            aliases.add(alias)
-            if info.is_dir():
+            aliases[alias] = is_directory
+            if is_directory:
                 directory_paths.add(parts)
                 continue
             file_paths.add(parts)
@@ -251,8 +258,13 @@ def validate_skill_zip(
         for path in all_paths:
             if any(path[:index] in file_paths for index in range(1, len(path))):
                 raise SkillPackageError("file and directory paths conflict")
-            if path in directory_paths:
-                raise SkillPackageError("file and directory paths conflict")
+        for directory_path in directory_paths:
+            if not any(
+                len(file_path) > len(directory_path)
+                and file_path[: len(directory_path)] == directory_path
+                for file_path in file_paths
+            ):
+                raise SkillPackageError("explicit empty directory is not allowed")
 
         root = next(iter(roots))
         files: dict[str, bytes] = {}
