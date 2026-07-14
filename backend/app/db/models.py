@@ -126,13 +126,22 @@ class HitlRequestRow(Base):
 
 class SkillRow(Base):
     __tablename__ = "skills"
+    __table_args__ = (UniqueConstraint("name", "version"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     created_by_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), index=True
     )
-    name: Mapped[str] = mapped_column(String(100), unique=True)
+    name: Mapped[str] = mapped_column(String(100), index=True)
+    version: Mapped[str] = mapped_column(String(64))
+    type: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
     description: Mapped[str] = mapped_column(Text, default="")
+    entrypoint: Mapped[str] = mapped_column(String(500))
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSON)
+    upload_sha256: Mapped[str] = mapped_column(String(64))
+    content_sha256: Mapped[str] = mapped_column(String(64))
+    install_path: Mapped[str] = mapped_column(String(1000))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

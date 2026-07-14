@@ -81,6 +81,12 @@ def test_schema_has_required_tables_foreign_keys_owner_indexes_and_unique_auth(t
             and {column.name for column in constraint.columns} == {"skill_id", "user_id"}
             for constraint in SkillAuthorizationRow.__table__.constraints
         )
+        assert not SkillRow.__table__.c.name.unique
+        assert any(
+            isinstance(constraint, UniqueConstraint)
+            and {column.name for column in constraint.columns} == {"name", "version"}
+            for constraint in SkillRow.__table__.constraints
+        )
 
     asyncio.run(_with_database(tmp_path, check))
 

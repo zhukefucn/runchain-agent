@@ -2,5 +2,6 @@
 
 from app.repositories.audit import AuditRepository
 from app.repositories.manager import ManagerRepository
+from app.repositories.skill import SkillRepository
 
-__all__ = ["AuditRepository", "ManagerRepository"]
+__all__ = ["AuditRepository", "ManagerRepository", "SkillRepository"]
