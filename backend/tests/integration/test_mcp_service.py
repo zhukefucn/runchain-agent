@@ -81,14 +81,18 @@ async def _register(service: McpService, users: dict[str, User]) -> McpServerRow
     )
 
 
-async def _fault_scenario(tmp_path: Path, check, *, call_timeout: float = 0.1, max_running: int = 2):
+async def _fault_scenario(
+    tmp_path: Path, check, *, call_timeout: float = 0.1,
+    max_running: int = 2, max_calls: int = 4,
+):
     engine = build_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'fault.db'}")
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     root = Path(__file__).parents[1] / "fixtures"
     allowlist = frozenset({"fault_mcp_server.py", "idle_crash_mcp_server.py"})
     registry = McpRuntimeRegistry(
         f"fault-{tmp_path.name}", root, Path(sys.executable), sessions,
-        max_running_servers=max_running, allowed_server_scripts=allowlist,
+        max_calls=max_calls, max_running_servers=max_running,
+        allowed_server_scripts=allowlist,
     )
     try:
         await create_schema(engine)
@@ -643,5 +647,109 @@ def test_cancelled_call_releases_slot_audits_once_retires_and_restarts(tmp_path)
         await service.start(admin, server.id)
         result = await service.call_tool(manager, server.id, "fault", {"mode": "ok"})
         assert result["mock"] is True
+
+    asyncio.run(_fault_scenario(tmp_path, check, call_timeout=2))
+
+
+def test_registry_close_wins_race_before_reserve_and_is_terminal(tmp_path, monkeypatch):
+    async def check(service, registry, users, _db):
+        server = await _register_fault(service, users)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original = McpRuntimeRegistry.reserve
+
+        async def paused_reserve(self, runtime):
+            entered.set()
+            await release.wait()
+            await original(self, runtime)
+
+        monkeypatch.setattr(McpRuntimeRegistry, "reserve", paused_reserve)
+        start = asyncio.create_task(
+            service.start(_principal(users["business_admin01"]), server.id)
+        )
+        await entered.wait()
+        await asyncio.gather(registry.shutdown_all(), registry.aclose())
+        release.set()
+        with pytest.raises(McpUnavailableError, match="closed"):
+            await start
+        assert registry.closed is True
+        assert registry.runtimes == {}
+        with pytest.raises(McpUnavailableError, match="closed"):
+            await service.start(_principal(users["business_admin01"]), server.id)
+
+    asyncio.run(_fault_scenario(tmp_path, check, call_timeout=2))
+
+
+def test_registry_close_takes_over_reserved_runtime_and_waits_cleanup(tmp_path):
+    async def check(service, registry, users, _db):
+        server = await _register_fault(service, users)
+        await service.start(_principal(users["business_admin01"]), server.id)
+        runtime = await registry.current(server.id)
+        assert runtime is not None and runtime.task is not None
+        await asyncio.gather(registry.shutdown_all(), registry.aclose(), registry.shutdown_all())
+        assert registry.closed is True
+        assert registry.runtimes == {}
+        assert runtime.task.done()
+
+    asyncio.run(_fault_scenario(tmp_path, check, call_timeout=2))
+
+
+def test_cancel_while_waiting_call_slot_does_not_retire_shared_runtime(tmp_path):
+    async def check(service, registry, users, db):
+        admin = _principal(users["business_admin01"])
+        manager = _principal(users["manager0001"])
+        server = await _register_fault(service, users)
+        await service.authorize(admin, server.id, users["manager0001"].id)
+        await service.start(admin, server.id)
+        runtime = await registry.current(server.id)
+        occupying = asyncio.create_task(
+            service.call_tool(manager, server.id, "fault", {"mode": "timeout"})
+        )
+        await asyncio.sleep(0.05)
+        queued = asyncio.create_task(
+            service.call_tool(manager, server.id, "fault", {"mode": "ok"})
+        )
+        await asyncio.sleep(0.05)
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        assert await registry.current(server.id) is runtime
+        assert (await occupying)["mock"] is True
+        calls = list(await db.scalars(select(AuditRecordRow).where(AuditRecordRow.action == "mcp.call")))
+        assert sorted(row.result for row in calls) == ["cancelled", "success"]
+
+    asyncio.run(_fault_scenario(tmp_path, check, call_timeout=2, max_running=2, max_calls=1))
+
+
+def test_cancel_during_authorization_does_not_retire_and_double_cancel_audits_once(
+    tmp_path, monkeypatch
+):
+    async def check(service, registry, users, db):
+        admin = _principal(users["business_admin01"])
+        manager = _principal(users["manager0001"])
+        server = await _register_fault(service, users)
+        await service.authorize(admin, server.id, users["manager0001"].id)
+        await service.start(admin, server.id)
+        runtime = await registry.current(server.id)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original = service._can_call
+
+        async def blocked(db_session, actor, server_id):
+            entered.set()
+            await release.wait()
+            return await original(db_session, actor, server_id)
+
+        monkeypatch.setattr(service, "_can_call", blocked)
+        task = asyncio.create_task(service.call_tool(manager, server.id, "fault", {"mode": "ok"}))
+        await entered.wait()
+        task.cancel()
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await registry.current(server.id) is runtime
+        calls = list(await db.scalars(select(AuditRecordRow).where(AuditRecordRow.action == "mcp.call")))
+        assert len(calls) == 1 and calls[0].result == "cancelled"
 
     asyncio.run(_fault_scenario(tmp_path, check, call_timeout=2))

@@ -131,6 +131,9 @@ class McpRuntimeRegistry:
     _global_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _config_fingerprint: str = field(init=False)
     _notifications: set[asyncio.Task[None]] = field(default_factory=set, init=False)
+    closing: bool = field(default=False, init=False)
+    closed: bool = field(default=False, init=False)
+    _close_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if not self.application_namespace or self.max_calls < 1 or self.max_running_servers < 1:
@@ -169,6 +172,8 @@ class McpRuntimeRegistry:
 
     async def reserve(self, runtime: _Runtime) -> None:
         async with self._global_lock:
+            if self.closing or self.closed:
+                raise McpUnavailableError("MCP runtime registry is closed")
             current = next(
                 (item for key, item in self.runtimes.items() if key.server_id == runtime.key.server_id),
                 None,
@@ -232,6 +237,14 @@ class McpRuntimeRegistry:
 
     async def shutdown_all(self) -> None:
         async with self._global_lock:
+            if self._close_task is None:
+                self.closing = True
+                self._close_task = asyncio.create_task(self._close_impl())
+            close_task = self._close_task
+        await asyncio.shield(close_task)
+
+    async def _close_impl(self) -> None:
+        async with self._global_lock:
             runtimes = list(self.runtimes.values())
             self.runtimes.clear()
             for runtime in runtimes:
@@ -240,8 +253,11 @@ class McpRuntimeRegistry:
             *(_stop_runtime_process(runtime) for runtime in runtimes),
             return_exceptions=True,
         )
-        if self._notifications:
+        while self._notifications:
             await asyncio.gather(*tuple(self._notifications), return_exceptions=True)
+        async with self._global_lock:
+            self.closed = True
+            self.closing = False
 
     async def aclose(self) -> None:
         await self.shutdown_all()
@@ -714,6 +730,7 @@ class McpService:
         result = "failure"
         runtime: _Runtime | None = None
         retire_code: str | None = None
+        request_started = False
         try:
             async with self._sessions() as db:
                 await self._get(db, server_id)
@@ -727,20 +744,29 @@ class McpService:
                 raise McpValidationError("tool was not advertised by the MCP server")
             if type(arguments) is not dict:
                 raise McpValidationError("tool arguments must be an object")
-            encoded_input = json.dumps(
-                arguments, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
+            try:
+                encoded_input = json.dumps(
+                    arguments, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise McpValidationError(
+                    "tool input must be JSON serializable"
+                ) from exc
             if len(encoded_input) > self._max_input_bytes:
                 raise McpValidationError("tool input exceeded the configured limit")
             declared = tool.inputSchema.get("properties", {})
             if type(declared) is not dict or set(arguments).difference(declared):
                 raise McpValidationError("tool arguments contain undeclared fields")
-            validator = Draft202012Validator(
-                tool.inputSchema, format_checker=FormatChecker()
-            )
-            errors = sorted(
-                validator.iter_errors(arguments), key=lambda item: list(item.path)
-            )
+            try:
+                validator = Draft202012Validator(
+                    tool.inputSchema, format_checker=FormatChecker()
+                )
+                errors = sorted(
+                    validator.iter_errors(arguments), key=lambda item: list(item.path)
+                )
+            except (TypeError, ValueError):
+                retire_code = "CALL_FAILED"
+                raise
             if errors:
                 raise McpValidationError(
                     "tool arguments do not match the advertised schema"
@@ -748,6 +774,7 @@ class McpService:
             async with self._calls:
                 assert runtime.session is not None
                 try:
+                    request_started = True
                     response = await asyncio.wait_for(
                         runtime.session.call_tool(tool_name, arguments),
                         timeout=self._call_timeout,
@@ -755,10 +782,6 @@ class McpService:
                 except asyncio.TimeoutError as exc:
                     retire_code = "CALL_TIMEOUT"
                     raise McpUnavailableError("MCP tool call timed out") from exc
-                except asyncio.CancelledError:
-                    result = "cancelled"
-                    retire_code = "CALL_CANCELLED"
-                    raise
                 except BaseException:
                     retire_code = "CALL_FAILED"
                     raise
@@ -783,8 +806,11 @@ class McpService:
                 )
             result = "success"
             return output
-        except (TypeError, ValueError) as exc:
-            raise McpValidationError("tool input must be JSON serializable") from exc
+        except asyncio.CancelledError:
+            result = "cancelled"
+            if request_started:
+                retire_code = "CALL_CANCELLED"
+            raise
         finally:
             if retire_code is not None and runtime is not None:
                 await self._retire_failed_runtime(

@@ -97,3 +97,36 @@ Review-remediation verification:
 - `python -m compileall -q backend`: passed
 - `python -m pip check`: no broken requirements
 - `git diff --check`: passed (normal Windows LF/CRLF notices only)
+
+### Terminal close and full-stage cancellation follow-up
+
+Registry shutdown is now terminal. Under the registry global lock, the first
+`shutdown_all()`/`aclose()` sets `closing` and creates one shared close task;
+all concurrent close callers shield-wait that same task. `reserve()` rejects
+both closing and closed registries, including the race where start has finished
+database/hash validation but has not reserved a slot. The close task atomically
+takes all reserved/current runtimes, waits for process and notification cleanup,
+then marks the registry closed. Later starts remain rejected; a new application
+must create a new registry. Running-slot usage is therefore zero at terminal
+completion. Per-server locks are intentionally retained for the small Phase 1
+database-bounded server set so lock identity cannot change during a generation.
+
+Cancellation is handled by the outermost `call_tool` scope, including database
+authorization, runtime lookup, JSON/schema validation, semaphore acquisition,
+SDK request, and output parsing. Every cancellation writes exactly one
+`cancelled` metadata audit through the uncancellable short audit task. The
+shared runtime is compare-retired only after the protocol request was actually
+started; cancelling while waiting for authorization or a call slot neither
+kills the shared runtime nor leaks a semaphore slot. Repeated cancellation is
+deferred until the single audit task completes. Input JSON encoding catches are
+local to `json.dumps`; SDK/schema `TypeError`/`ValueError` are no longer
+misreported as user input errors.
+
+Final follow-up verification:
+
+- MCP integration tests: `24 passed`
+- Task-specific plus schema/setup contracts: `34 passed`
+- Full suite: `257 passed, 2 skipped`
+- `python -m compileall -q backend`: passed
+- `python -m pip check`: no broken requirements
+- `git diff --check`: passed (normal Windows LF/CRLF notices only)
