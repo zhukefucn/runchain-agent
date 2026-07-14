@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import shutil
+import stat
 import sys
 
 import uvicorn
@@ -12,14 +13,36 @@ import uvicorn
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKEND = ROOT / "backend"
-E2E_ROOT = (ROOT / ".run" / "e2e").resolve()
+E2E_ROOT = ROOT / ".run" / "e2e"
+
+
+def _absolute_without_resolving(path: Path) -> Path:
+    return Path(os.path.abspath(path))
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        attributes = os.lstat(path).st_file_attributes
+    except (FileNotFoundError, AttributeError):
+        return False
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _assert_safe_e2e_root(root: Path, e2e_root: Path) -> None:
+    lexical_root = _absolute_without_resolving(root)
+    expected_run_root = lexical_root / ".run"
+    expected_e2e_root = expected_run_root / "e2e"
+    lexical_e2e_root = _absolute_without_resolving(e2e_root)
+    if lexical_e2e_root != expected_e2e_root:
+        raise RuntimeError("refusing to reset a non-E2E path")
+    for candidate in (expected_run_root, expected_e2e_root):
+        if _is_reparse_point(candidate):
+            raise RuntimeError(f"refusing to reset an E2E reparse point: {candidate}")
 
 
 def main() -> None:
     """Reset only the dedicated E2E root, then run in the foreground."""
-    run_root = (ROOT / ".run").resolve()
-    if E2E_ROOT.parent != run_root or E2E_ROOT.name != "e2e":
-        raise RuntimeError("refusing to reset a non-E2E path")
+    _assert_safe_e2e_root(ROOT, E2E_ROOT)
     if E2E_ROOT.exists():
         shutil.rmtree(E2E_ROOT)
     E2E_ROOT.mkdir(parents=True)

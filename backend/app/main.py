@@ -14,7 +14,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from argon2 import PasswordHasher
 from fastapi.responses import FileResponse, JSONResponse
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentscope.app import create_app as create_agentscope_app
@@ -39,9 +39,11 @@ from app.api.health import router as health_router
 from app.api.manager import router as manager_router
 from app.api.system import router as system_router
 from app.auth.security import decode_access_token
+from app.auth.models import Principal
+from app.auth.security import BANK_DEMO_TENANT_ID
 from app.auth.deps import get_session, get_settings as auth_get_settings
 from app.config import Settings
-from app.db.models import Role, SessionRecordRow, User
+from app.db.models import McpAuthorizationRow, McpServerRow, Role, SessionRecordRow, SkillAuthorizationRow, User
 from app.db.seed import seed_demo_data
 from app.db.session import build_async_engine, create_schema
 from app.errors import install_error_handlers
@@ -184,6 +186,82 @@ def create_root_app(
 
     runtime: dict[str, Any] = {}
 
+    async def governed_reception_tools(
+        owner_user_id: str, session_id: str, prompt: str
+    ):
+        async with sessions() as db:
+            session = await db.get(SessionRecordRow, (owner_user_id, session_id))
+            server = await db.scalar(
+                select(McpServerRow)
+                .join(
+                    McpAuthorizationRow,
+                    McpAuthorizationRow.server_id == McpServerRow.id,
+                )
+                .where(
+                    McpAuthorizationRow.user_id == owner_user_id,
+                    McpServerRow.status == "running",
+                )
+                .order_by(McpServerRow.created_at, McpServerRow.id)
+            )
+        if session is None:
+            return {}
+        paths: dict[str, Any] = {}
+        python_skills = [
+            skill
+            for skill in await runtime["skill_service"].effective_skills(owner_user_id)
+            if skill.type == "python"
+        ]
+        if python_skills:
+            async with sessions() as db:
+                authorization_rows = (
+                    await db.execute(
+                        select(
+                            SkillAuthorizationRow.skill_id,
+                            func.count(SkillAuthorizationRow.id),
+                        )
+                        .where(
+                            SkillAuthorizationRow.skill_id.in_(
+                                [item.id for item in python_skills]
+                            )
+                        )
+                        .group_by(SkillAuthorizationRow.skill_id)
+                    )
+                ).all()
+                authorization_counts = dict(authorization_rows)
+            skill = max(
+                python_skills,
+                key=lambda item: (authorization_counts.get(item.id, 0), item.name),
+            )
+
+            async def dining(_owner: str, current_prompt: str):
+                return await runtime["authorized_tool_service"].invoke_python_skill(
+                    owner_user_id,
+                    session.agent_id,
+                    session_id,
+                    skill.id,
+                    {"prompt": current_prompt},
+                    request_id=str(uuid4()),
+                )
+
+            paths["dining"] = dining
+        if server is not None:
+            principal = Principal(owner_user_id, Role.MANAGER, BANK_DEMO_TENANT_ID)
+
+            async def pickup(_owner: str, _current_prompt: str):
+                return await runtime["mcp_service"].call_tool(
+                    principal,
+                    server.id,
+                    "plan_pickup",
+                    {
+                        "arrival_time": "2026-07-15T18:00:00+08:00",
+                        "station": "南京南站",
+                        "guest_count": 4,
+                    },
+                )
+
+            paths["pickup"] = pickup
+        return paths
+
     async def extra_tools(user_id: str, agent_id: str, session_id: str):
         return await runtime["authorized_tool_service"].authorized_tools(
             user_id, agent_id, session_id
@@ -280,6 +358,8 @@ def create_root_app(
                 sessions, skill_service, executor, mcp_service, registry
             )
             runtime["authorized_tool_service"] = authorized
+            runtime["skill_service"] = skill_service
+            runtime["mcp_service"] = mcp_service
             app.state.skill_service = skill_service
             app.state.skill_executor = executor
             app.state.mcp_service = mcp_service
@@ -313,6 +393,7 @@ def create_root_app(
         storage=storage,
         message_bus=bus,
         workspace_manager=workspace,
+        governed_tool_provider=governed_reception_tools,
     )
     app.state.hitl_service = HitlService(sessions)
     app.add_middleware(_IdentitySanitizerMiddleware)

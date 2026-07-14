@@ -61,6 +61,7 @@ class SessionRecordRow(Base):
     agent_id: Mapped[str] = mapped_column(String(100))
     title: Mapped[str] = mapped_column(String(200), default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
+    is_internal: Mapped[bool] = mapped_column(Boolean, default=False)
     source: Mapped[str] = mapped_column(String(32), default="user")
     source_schedule_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     team_id: Mapped[str | None] = mapped_column(String(100), nullable=True)

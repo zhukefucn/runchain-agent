@@ -48,18 +48,26 @@ it("business admin cannot submit a second mutation while one is pending", async 
 });
 
 it("business admin shows tools returned by an MCP connectivity test", async () => {
-  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.endsWith("/skills") || url.endsWith("/skill-invocations")) return jsonResponse({ items: [] });
     if (url.endsWith("/mcp-servers")) return jsonResponse({ items: [{ id: "m1", name: "接站规划", transport: "stdio", status: "stopped" }] });
     if (url.endsWith("/mcp-servers/m1/test")) return jsonResponse({ server_id: "m1", healthy: true, tools: [{ name: "plan_pickup", description: "规划接站" }] });
+    if (url.endsWith("/mcp-servers/m1/authorizations")) return jsonResponse({ id: "a1", server_id: "m1", user_id: "manager-id" });
     throw new Error(url);
-  }));
+  });
+  vi.stubGlobal("fetch", fetchMock);
   const { pinia } = createTestingApp({ username: "business_admin01", role: "business_admin", authenticated: true });
   render(BusinessAdminView, { global: { plugins: [pinia] } });
   await fireEvent.click(screen.getByRole("button", { name: /MCP Server/ }));
   await fireEvent.click(await screen.findByRole("button", { name: "测试连接" }));
   expect(await screen.findByText("plan_pickup")).toBeInTheDocument();
+  await fireEvent.update(screen.getByLabelText("授权 接站规划 MCP 给经理"), "manager-id");
+  await fireEvent.click(screen.getByRole("button", { name: "授权" }));
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/api/business/mcp-servers/m1/authorizations",
+    expect.objectContaining({ method: "POST" }),
+  );
 });
 
 it("system admin creates a manager and sees only safe model metadata", async () => {

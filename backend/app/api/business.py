@@ -381,4 +381,28 @@ async def test_mcp_server(
     return {"server_id": server_id, "healthy": healthy, "tools": tools}
 
 
+@router.post("/mcp-servers/{server_id}/authorizations")
+async def authorize_mcp_server(
+    server_id: str,
+    payload: AuthorizationRequest,
+    request: Request,
+    principal: BusinessPrincipal,
+):
+    try:
+        row = await request.app.state.mcp_service.authorize(
+            principal,
+            server_id,
+            payload.manager_user_id,
+            request_id=request.state.request_id,
+        )
+    except Exception as error:
+        api_error = _mcp_error(error)
+        await _audit_failure_once(
+            request, principal, "mcp.authorize", "mcp_server", server_id,
+            "authorize", api_error.status_code,
+        )
+        raise api_error from error
+    return {"id": row.id, "server_id": row.server_id, "user_id": row.user_id}
+
+
 __all__ = ["router"]

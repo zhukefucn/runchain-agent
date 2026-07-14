@@ -6,13 +6,55 @@ param(
 
 $ErrorActionPreference = "Stop"
 $projectRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$approvedRunRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot ".run"))
 if ([string]::IsNullOrWhiteSpace($RunDirectory)) {
-    $RunDirectory = Join-Path $projectRoot ".run"
+    $RunDirectory = $approvedRunRoot
 }
 $resolvedRunDirectory = [System.IO.Path]::GetFullPath($RunDirectory)
 $recordPath = Join-Path $resolvedRunDirectory "server.json"
 $expectedPython = [System.IO.Path]::GetFullPath((Join-Path $projectRoot ".venv\Scripts\python.exe"))
 $expectedLauncher = [System.IO.Path]::GetFullPath((Join-Path $resolvedRunDirectory "launcher.py"))
+
+function Test-ContainedPath {
+    param([string]$Candidate, [string]$ExpectedParent)
+
+    $candidatePath = [System.IO.Path]::GetFullPath($Candidate).TrimEnd('\')
+    $parentPath = [System.IO.Path]::GetFullPath($ExpectedParent).TrimEnd('\')
+    return [string]::Equals(
+        $candidatePath,
+        $parentPath,
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or $candidatePath.StartsWith(
+        $parentPath + '\',
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Assert-NoReparsePoint {
+    param([string]$Path, [string]$Boundary)
+
+    $current = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $boundaryPath = [System.IO.Path]::GetFullPath($Boundary).TrimEnd('\')
+    if (-not (Test-ContainedPath $current $boundaryPath)) {
+        throw "Path escaped its approved boundary: $current"
+    }
+    while ($true) {
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Reparse point is not allowed in DEMO runtime paths: $current"
+            }
+        }
+        if ([string]::Equals($current, $boundaryPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $parent = [System.IO.Directory]::GetParent($current)
+        if ($null -eq $parent) {
+            throw "Could not verify DEMO runtime path containment: $current"
+        }
+        $current = $parent.FullName.TrimEnd('\')
+    }
+}
 
 function Test-SamePath {
     param([string]$Left, [string]$Right)
@@ -26,6 +68,41 @@ function Test-SamePath {
     }
     catch {
         return $false
+    }
+}
+
+function Assert-TrustedRecord {
+    param($Record)
+
+    $identityErrors = [System.Collections.Generic.List[string]]::new()
+    if ([int]$Record.schemaVersion -ne 1 -or [int]$Record.pid -le 0) {
+        $identityErrors.Add("schema or pid")
+    }
+    if (-not (Test-SamePath ([string]$Record.projectRoot) $projectRoot)) {
+        $identityErrors.Add("projectRoot")
+    }
+    if (-not (Test-SamePath ([string]$Record.executablePath) $expectedPython)) {
+        $identityErrors.Add("executablePath record")
+    }
+    if (-not (Test-SamePath ([string]$Record.launcherPath) $expectedLauncher)) {
+        $identityErrors.Add("launcherPath")
+    }
+    $parsedRunId = [guid]::Empty
+    if (-not [guid]::TryParseExact([string]$Record.runId, "D", [ref]$parsedRunId)) {
+        $identityErrors.Add("runId format")
+    }
+    try {
+        [void][datetime]::Parse(
+            [string]$Record.processStartTimeUtc,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind
+        )
+    }
+    catch {
+        $identityErrors.Add("processStartTimeUtc")
+    }
+    if ($identityErrors.Count -gt 0) {
+        throw "Process identity record failed validation ($($identityErrors -join ', '))."
     }
 }
 
@@ -82,16 +159,21 @@ function Assert-OwnedProcessIdentity {
     return $cim
 }
 
+if (-not (Test-ContainedPath $resolvedRunDirectory $approvedRunRoot)) {
+    throw "RunDirectory must be contained by the project's .run directory."
+}
+Assert-NoReparsePoint $resolvedRunDirectory $approvedRunRoot
+Assert-NoReparsePoint $expectedLauncher $approvedRunRoot
+
 if (-not (Test-Path -LiteralPath $recordPath)) {
     Write-Host "No DEMO process record found; nothing to stop."
     exit 0
 }
+Assert-NoReparsePoint $recordPath $approvedRunRoot
 
 try {
     $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
-    if ([int]$record.schemaVersion -ne 1 -or [int]$record.pid -le 0) {
-        throw "Process identity record is invalid."
-    }
+    Assert-TrustedRecord $record
 }
 catch {
     throw "Process identity record cannot be trusted: $($_.Exception.Message)"
@@ -99,6 +181,8 @@ catch {
 
 $ownedProcess = Assert-OwnedProcessIdentity $record
 if ($null -eq $ownedProcess) {
+    Assert-NoReparsePoint $recordPath $approvedRunRoot
+    Assert-NoReparsePoint $expectedLauncher $approvedRunRoot
     Remove-Item -LiteralPath $recordPath -Force
     Remove-Item -LiteralPath $expectedLauncher -Force -ErrorAction SilentlyContinue
     Write-Host "Removed stale DEMO process record; no process was stopped."
@@ -123,7 +207,8 @@ if ($null -ne (Get-Process -Id $recordedPid -ErrorAction SilentlyContinue)) {
     Wait-Process -Id $recordedPid -Timeout 5 -ErrorAction SilentlyContinue
 }
 
+Assert-NoReparsePoint $recordPath $approvedRunRoot
+Assert-NoReparsePoint $expectedLauncher $approvedRunRoot
 Remove-Item -LiteralPath $recordPath -Force
 Remove-Item -LiteralPath $expectedLauncher -Force -ErrorAction SilentlyContinue
 Write-Host "Stopped verified DEMO process PID $recordedPid."
-

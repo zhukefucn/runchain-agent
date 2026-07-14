@@ -21,8 +21,11 @@ from app.db.models import (
     McpServerRow,
     Role,
     SessionRecordRow,
+    SkillInvocationRow,
+    SkillRow,
     User,
 )
+from app.repositories.audit import AuditRepository
 from app.runner.protocol import SkillExecutionRequest
 
 
@@ -191,6 +194,89 @@ class AuthorizedToolService:
                     )
         return tools
 
+    async def invoke_python_skill(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        skill_id: str,
+        input_data: dict[str, Any],
+        *,
+        request_id: str,
+    ) -> dict[str, Any]:
+        manager = await self._verified_manager(user_id, agent_id, session_id)
+        skills = await self._skills.effective_skills(manager.id)
+        skill = next(
+            (item for item in skills if item.id == skill_id and item.type == "python"),
+            None,
+        )
+        if skill is None:
+            await self._audit_skill_denial(manager.id, skill_id, request_id)
+            raise LookupError("skill unavailable")
+        invocation: SkillInvocationRow | None = None
+        async with self._sessions() as db:
+            if await db.get(SkillRow, skill.id) is not None:
+                invocation = SkillInvocationRow(
+                    skill_id=skill.id,
+                    session_id=session_id,
+                    owner_user_id=manager.id,
+                    status="pending",
+                    input_data=input_data,
+                )
+                db.add(invocation)
+                await db.commit()
+                await db.refresh(invocation)
+        result = await self._executor.execute(
+            SkillExecutionRequest(
+                user_id=manager.id,
+                skill_id=skill.id,
+                version=skill.version,
+                input_data=input_data,
+                request_id=request_id,
+            )
+        )
+        output = result.output if isinstance(result.output, dict) else {"value": result.output}
+        async with self._sessions() as db:
+            stored = (
+                await db.get(SkillInvocationRow, invocation.id)
+                if invocation is not None
+                else None
+            )
+            if stored is not None:
+                stored.status = result.status
+                stored.output_data = output if result.status == "success" else None
+                AuditRepository(db).add_pending(
+                    actor_user_id=manager.id,
+                    action="skill.invoke",
+                    resource_type="skill",
+                    resource_id=skill.id,
+                    result="success" if result.status == "success" else "failure",
+                    request_id=request_id,
+                    details={"operation": "invoke", "status": result.status},
+                )
+                await db.commit()
+        return {
+            "invocation_id": invocation.id if invocation is not None else None,
+            "status": result.status,
+            "output": result.output,
+            "error": result.stderr_summary or None,
+        }
+
+    async def _audit_skill_denial(
+        self, user_id: str, skill_id: str, request_id: str
+    ) -> None:
+        async with self._sessions() as db:
+            AuditRepository(db).add_pending(
+                actor_user_id=user_id,
+                action="skill.invoke",
+                resource_type="skill",
+                resource_id=skill_id,
+                result="failure",
+                request_id=request_id,
+                details={"operation": "invoke", "status": "denied"},
+            )
+            await db.commit()
+
     @staticmethod
     def _reserve_name(names: set[str], name: str) -> None:
         if name in names:
@@ -202,22 +288,18 @@ class AuthorizedToolService:
             input_data = kwargs.get("input_data", kwargs)
             if type(input_data) is not dict:
                 raise ValueError("skill input must be an object")
-            # A fresh governance/integrity check precedes every process launch.
-            await self._skills.resolve_execution_skill(user_id, skill.id, skill.version)
-            result = await self._executor.execute(
-                SkillExecutionRequest(
-                    user_id=user_id,
-                    skill_id=skill.id,
-                    version=skill.version,
-                    input_data=input_data,
-                    request_id=str(uuid4()),
-                )
+            async with self._sessions() as db:
+                session = await db.get(SessionRecordRow, (user_id, session_id))
+            if session is None:
+                raise PermissionError("session unavailable")
+            return await self.invoke_python_skill(
+                user_id,
+                session.agent_id,
+                session_id,
+                skill.id,
+                input_data,
+                request_id=str(uuid4()),
             )
-            return {
-                "status": result.status,
-                "output": result.output,
-                "error": result.stderr_summary or None,
-            }
 
         public_schema = {
             "type": "object",

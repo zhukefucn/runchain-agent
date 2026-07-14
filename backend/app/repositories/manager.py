@@ -78,7 +78,7 @@ class ManagerRepository:
             .where(
                 SessionRecordRow.owner_user_id == owner_user_id,
                 self._owner_is_manager(owner_user_id),
-                ~SessionRecordRow.title.startswith("team:"),
+                SessionRecordRow.is_internal.is_(False),
             )
             .order_by(SessionRecordRow.created_at, SessionRecordRow.id)
         )

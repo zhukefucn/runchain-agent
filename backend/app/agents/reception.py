@@ -24,6 +24,9 @@ from .sse import StableEvent
 
 
 AgentTool = Callable[[str, str], Awaitable[dict[str, Any]]]
+GovernedToolProvider = Callable[
+    [str, str, str], Awaitable[dict[str, AgentTool]]
+]
 logger = logging.getLogger(__name__)
 _AGENT_TYPES = ("pickup", "lodging", "dining")
 _TOOL_PATHS = {
@@ -106,7 +109,7 @@ async def _await_uncancellable(awaitable) -> None:
 class ReceptionTeamRuntime:
     """Deterministic Phase-1 orchestration over real AgentScope templates."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, pickup_tool: AgentTool | None = None, lodging_tool: AgentTool | None = None, dining_skill: AgentTool | None = None, templates: list[SubAgentTemplate] | None = None, storage: StorageBase | None = None, message_bus: MessageBus | None = None, workspace_manager: Any = None, after_hitl_commit: Callable[[], Awaitable[None]] | None = None, before_cancel_finalize: Callable[[], Awaitable[None]] | None = None, before_setup_failure_finalize: Callable[[], Awaitable[None]] | None = None, team_create_factory: Callable[..., Any] = TeamCreate, agent_create_factory: Callable[..., Any] = AgentCreate) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, pickup_tool: AgentTool | None = None, lodging_tool: AgentTool | None = None, dining_skill: AgentTool | None = None, governed_tool_provider: GovernedToolProvider | None = None, templates: list[SubAgentTemplate] | None = None, storage: StorageBase | None = None, message_bus: MessageBus | None = None, workspace_manager: Any = None, after_hitl_commit: Callable[[], Awaitable[None]] | None = None, before_cancel_finalize: Callable[[], Awaitable[None]] | None = None, before_setup_failure_finalize: Callable[[], Awaitable[None]] | None = None, team_create_factory: Callable[..., Any] = TeamCreate, agent_create_factory: Callable[..., Any] = AgentCreate) -> None:
         self._sessions = session_factory
         self._storage = storage or SQLiteStorage(session_factory)
         self._message_bus = message_bus or InMemoryMessageBus()
@@ -116,6 +119,7 @@ class ReceptionTeamRuntime:
         self._before_setup_failure_finalize = before_setup_failure_finalize
         self._team_create_factory = team_create_factory
         self._agent_create_factory = agent_create_factory
+        self._governed_tool_provider = governed_tool_provider
         self.tool_paths = {
             "pickup": pickup_tool or MockMcpPickupPath(),
             "lodging": lodging_tool or MockLodgingTool(),
@@ -198,6 +202,16 @@ class ReceptionTeamRuntime:
         ]
         if len(worker_ids) != len(_AGENT_TYPES):
             raise RuntimeError("AgentScope AgentCreate did not persist all workers")
+        async with self._sessions() as db:
+            await db.execute(
+                update(SessionRecordRow)
+                .where(
+                    SessionRecordRow.owner_user_id == owner,
+                    SessionRecordRow.agent_id.in_(worker_ids),
+                )
+                .values(is_internal=True)
+            )
+            await db.commit()
         return {"team_id": team.id, "worker_ids": worker_ids}
 
     async def _persist_results(self, owner: str, run_id: str, results: dict[str, dict[str, Any] | BaseException]) -> bool:
@@ -346,7 +360,12 @@ class ReceptionTeamRuntime:
                 yield self._event("agent_started", request_id, session_id, run_id, agent_type=agent_type)
                 tool_path, tool_name = _TOOL_PATHS[agent_type]
                 yield self._event("tool_call", request_id, session_id, run_id, agent_type=agent_type, tool_path=tool_path, tool_name=tool_name)
-            raw_results = await asyncio.gather(*(self._tools[k](owner_user_id, prompt) for k in _AGENT_TYPES), return_exceptions=True)
+            tools = dict(self._tools)
+            if self._governed_tool_provider is not None:
+                tools.update(
+                    await self._governed_tool_provider(owner_user_id, session_id, prompt)
+                )
+            raw_results = await asyncio.gather(*(tools[k](owner_user_id, prompt) for k in _AGENT_TYPES), return_exceptions=True)
             results = dict(zip(_AGENT_TYPES, raw_results, strict=True))
             failed = await self._persist_results(owner_user_id, run_id, results)
             for agent_type in _AGENT_TYPES:
@@ -377,6 +396,7 @@ class ReceptionTeamRuntime:
                 pass
             raise
         except Exception:
+            logger.exception("Reception runtime failed")
             await _await_uncancellable(
                 self._persist_runtime_failed(owner_user_id, run_id)
             )

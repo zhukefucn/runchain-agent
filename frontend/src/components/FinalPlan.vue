@@ -10,6 +10,7 @@ const labels: Record<string, string> = {
 const ignored = new Set([
   "status", "decision", "owner", "owner_user_id", "team_id", "worker_ids",
   "agent_id", "session_id", "run_id", "request_id",
+  "invocation_id",
 ]);
 function isPublicKey(key: string) { return !key.startsWith("_") && !ignored.has(key); }
 const sections = computed(() => {

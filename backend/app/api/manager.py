@@ -38,6 +38,12 @@ class ChatRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=10_000)
 
 
+class SkillInvokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input_data: dict[str, Any] = Field(default_factory=dict)
+
+
 class HitlDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -139,6 +145,16 @@ async def list_messages(
 ):
     repository = _manager_repository(request, db)
     if await repository.get_session(principal.user_id, session_id) is None:
+        await _audit(
+            request,
+            principal,
+            "manager.messages.read",
+            "session",
+            session_id,
+            "read",
+            result="failure",
+            status_code=404,
+        )
         raise ApiError(404, "NOT_FOUND", "资源不存在")
     rows = await repository.list_messages(principal.user_id, session_id)
     return {"items": [_message(row) for row in rows]}
@@ -316,6 +332,40 @@ async def list_authorized_skills(
             for row in rows
         ]
     }
+
+
+@router.post("/sessions/{session_id}/skills/{skill_id}/invoke")
+async def invoke_skill(
+    session_id: str,
+    skill_id: str,
+    payload: SkillInvokeRequest,
+    request: Request,
+    principal: ManagerPrincipal,
+    db: AsyncSession = Depends(get_session),
+):
+    session = await _manager_repository(request, db).get_session(
+        principal.user_id, session_id
+    )
+    if session is None:
+        await _audit(
+            request, principal, "skill.invoke", "skill", skill_id, "invoke",
+            result="failure", status_code=404,
+        )
+        raise ApiError(404, "NOT_FOUND", "资源不存在")
+    try:
+        result = await request.app.state.authorized_tool_service.invoke_python_skill(
+            principal.user_id,
+            session.agent_id,
+            session_id,
+            skill_id,
+            payload.input_data,
+            request_id=request.state.request_id,
+        )
+    except (LookupError, PermissionError):
+        raise ApiError(404, "NOT_FOUND", "资源不存在")
+    if result["status"] != "success":
+        raise ApiError(409, "SKILL_EXECUTION_FAILED", "Skill 执行失败")
+    return result
 
 
 @router.get("/files")

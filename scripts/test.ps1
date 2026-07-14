@@ -23,8 +23,15 @@ if (-not (Get-Command pnpm -ErrorAction SilentlyContinue)) {
     throw "pnpm is required."
 }
 
-Push-Location $projectRoot
+$previousRealModelTestsEnvironment = Get-Item Env:RUN_REAL_MODEL_TESTS -ErrorAction SilentlyContinue
+$locationPushed = $false
 try {
+    if ($RunRealModel) {
+        $env:RUN_REAL_MODEL_TESTS = "1"
+    }
+    Push-Location $projectRoot
+    $locationPushed = $true
+
     Write-Host "[1/5] Backend tests (real model excluded)"
     & $pythonPath -m pytest backend/tests -q -m "not real_model"
     Assert-LastExitCode "Backend tests"
@@ -61,7 +68,17 @@ try {
     }
 }
 finally {
-    Pop-Location
+    if ($locationPushed) {
+        Pop-Location
+    }
+    if ($RunRealModel) {
+        if ($null -eq $previousRealModelTestsEnvironment) {
+            Remove-Item Env:RUN_REAL_MODEL_TESTS -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:RUN_REAL_MODEL_TESTS = $previousRealModelTestsEnvironment.Value
+        }
+    }
 }
 
 Write-Host "Verification complete."

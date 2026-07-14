@@ -67,7 +67,10 @@ def _skill_zip() -> bytes:
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("api-demo/SKILL.md", "# API demo")
         archive.writestr("api-demo/skill.json", json.dumps(manifest))
-        archive.writestr("api-demo/main.py", "print('ok')")
+        archive.writestr(
+            "api-demo/main.py",
+            "import json,sys\np=json.load(sys.stdin)\nprint(json.dumps({'executed': True, 'input': p}))",
+        )
     return output.getvalue()
 
 
@@ -115,6 +118,13 @@ def test_public_manager_sessions_hide_internal_agentscope_workers(tmp_path):
             )
             assert response.status_code == 200
 
+            user_team_title = await client.post(
+                "/api/manager/sessions",
+                headers=headers,
+                json={"title": "team:user-visible", "agent_id": "reception-leader"},
+            )
+            assert user_team_title.status_code == 201
+
             async with app.state.session_factory() as db:
                 stored = list(
                     await db.scalars(
@@ -131,12 +141,8 @@ def test_public_manager_sessions_hide_internal_agentscope_workers(tmp_path):
             listed = await client.get("/api/manager/sessions", headers=headers)
             assert listed.status_code == 200
             assert [item["id"] for item in listed.json()["items"]] == [
-                created.json()["id"]
+                created.json()["id"], user_team_title.json()["id"]
             ]
-            assert all(
-                not item["title"].startswith("team:")
-                for item in listed.json()["items"]
-            )
 
     asyncio.run(scenario())
 
@@ -194,7 +200,7 @@ def test_both_managers_are_isolated_and_client_cannot_supply_owner(tmp_path):
     asyncio.run(scenario())
 
 
-def test_messages_get_does_not_audit_chat_but_missing_post_chat_does(tmp_path):
+def test_missing_messages_read_and_chat_are_distinct_audited_security_actions(tmp_path):
     async def scenario():
         async with _client(tmp_path) as (client, app):
             headers = await _auth(client, "manager0001")
@@ -222,7 +228,9 @@ def test_messages_get_does_not_audit_chat_but_missing_post_chat_does(tmp_path):
                         )
                     )
                 )
-            assert read_audits == []
+            assert len(read_audits) == 1
+            assert read_audits[0].action == "manager.messages.read"
+            assert read_audits[0].result == "failure"
             assert len(post_audits) == 1
             assert post_audits[0].action == "manager.chat.start"
             assert post_audits[0].result == "failure"
@@ -456,6 +464,7 @@ def test_business_skill_lifecycle_authorization_metadata_and_audit(tmp_path):
         async with _client(tmp_path) as (client, app):
             admin = await _auth(client, "business_admin01")
             manager = await _auth(client, "manager0001")
+            other_manager = await _auth(client, "manager0002")
             async with app.state.session_factory() as db:
                 target = await db.scalar(
                     select(User).where(User.username == "manager0001")
@@ -485,6 +494,33 @@ def test_business_skill_lifecycle_authorization_metadata_and_audit(tmp_path):
             visible = await client.get("/api/manager/skills", headers=manager)
             assert [item["id"] for item in visible.json()["items"]] == [skill_id]
 
+            session = await client.post(
+                "/api/manager/sessions",
+                headers=manager,
+                json={"title": "runner probe", "agent_id": "reception-leader"},
+            )
+            invoked = await client.post(
+                f"/api/manager/sessions/{session.json()['id']}/skills/{skill_id}/invoke",
+                headers=manager,
+                json={"input_data": {"probe": True}},
+            )
+            assert invoked.status_code == 200
+            assert invoked.json()["output"] == {
+                "executed": True,
+                "input": {"probe": True},
+            }
+            other_session = await client.post(
+                "/api/manager/sessions",
+                headers=other_manager,
+                json={"title": "denied probe", "agent_id": "reception-leader"},
+            )
+            denied = await client.post(
+                f"/api/manager/sessions/{other_session.json()['id']}/skills/{skill_id}/invoke",
+                headers=other_manager,
+                json={"input_data": {"probe": True}},
+            )
+            assert denied.status_code == 404
+
             invocations = await client.get(
                 "/api/business/skill-invocations", headers=admin
             )
@@ -498,7 +534,7 @@ def test_business_skill_lifecycle_authorization_metadata_and_audit(tmp_path):
             assert disabled.status_code == 200
             async with app.state.session_factory() as db:
                 actions = set(await db.scalars(select(AuditRecordRow.action)))
-            assert {"skill.install", "skill.publish", "skill.authorize", "skill.disable"} <= actions
+            assert {"skill.install", "skill.publish", "skill.authorize", "skill.invoke", "skill.disable"} <= actions
 
     asyncio.run(scenario())
 
