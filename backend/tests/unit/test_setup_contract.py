@@ -37,3 +37,21 @@ def test_database_dependencies_are_exactly_pinned():
     for pin in required_pins:
         assert f'"{pin}"' in pyproject
         assert pin in lock_lines
+
+
+def test_auth_api_dependencies_are_exactly_pinned():
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text()
+    lock_lines = (PROJECT_ROOT / "requirements.lock").read_text().splitlines()
+    runtime_pins = [
+        "fastapi==0.139.0",
+        "PyJWT==2.13.0",
+    ]
+    test_pins = ["httpx==0.28.1"]
+
+    for pin in runtime_pins:
+        assert f'"{pin}"' in pyproject
+        assert pin in lock_lines
+    for pin in test_pins:
+        assert f'"{pin}"' in pyproject
+        assert pin in lock_lines
+    assert "starlette==1.3.1" in lock_lines

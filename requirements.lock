@@ -25,6 +25,7 @@ dashscope==1.26.3
 distro==1.9.0
 docstring_parser==0.18.0
 filetype==1.2.0
+fastapi==0.139.0
 frozenlist==1.8.0
 googleapis-common-protos==1.75.0
 grpcio==1.82.1
