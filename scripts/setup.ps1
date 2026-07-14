@@ -4,6 +4,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $venvPath = Join-Path $projectRoot ".venv"
 $venvPython = Join-Path $venvPath "Scripts\python.exe"
 $agentscopePath = [System.IO.Path]::GetFullPath((Join-Path $projectRoot "..\agentscope-main"))
+$lockPath = Join-Path $projectRoot "requirements.lock"
 
 function Find-SupportedPython {
     $candidates = [System.Collections.Generic.List[object]]::new()
@@ -40,6 +41,10 @@ if (-not (Test-Path $agentscopePath)) {
     throw "Local AgentScope checkout was not found at $agentscopePath"
 }
 
+if (-not (Test-Path $lockPath)) {
+    throw "Locked dependencies were not found at $lockPath"
+}
+
 if (-not (Test-Path $venvPython)) {
     $python = Find-SupportedPython
     if ($null -eq $python) {
@@ -54,14 +59,20 @@ if (-not (Test-Path $venvPython)) {
     }
 }
 
-Write-Host "Installing pinned demo dependencies"
-& $venvPython -m pip install --disable-pip-version-check --editable "${projectRoot}[dev]"
+Write-Host "Installing locked dependencies"
+& $venvPython -m pip install --disable-pip-version-check --requirement $lockPath
 if ($LASTEXITCODE -ne 0) {
-    throw "Demo dependency installation failed."
+    throw "Locked dependency installation failed."
 }
 
-Write-Host "Installing the local AgentScope checkout in editable mode"
-& $venvPython -m pip install --disable-pip-version-check --editable $agentscopePath
+Write-Host "Installing the local demo in editable mode without resolving dependencies"
+& $venvPython -m pip install --disable-pip-version-check --no-deps --editable "${projectRoot}[dev]"
+if ($LASTEXITCODE -ne 0) {
+    throw "Demo installation failed."
+}
+
+Write-Host "Installing the local AgentScope checkout in editable mode without resolving dependencies"
+& $venvPython -m pip install --disable-pip-version-check --no-deps --editable $agentscopePath
 if ($LASTEXITCODE -ne 0) {
     throw "AgentScope installation failed."
 }
