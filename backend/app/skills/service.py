@@ -20,7 +20,8 @@ from app.db.models import Role, SkillRow
 from app.repositories.audit import AuditRepository
 from app.repositories.skill import SkillRepository
 from app.skills.package import (
-    MAX_ENTRIES,
+    MAX_MATERIALIZED_ENTRIES,
+    MAX_PATH_DEPTH,
     MAX_FILES,
     MAX_FILE_BYTES,
     MAX_TOTAL_BYTES,
@@ -155,6 +156,7 @@ def _scan_installed_skill(
     root: Path,
     *,
     expected_hashes: dict[str, str],
+    expected_directories: tuple[str, ...],
     expected_canonical_hash: str,
     expected_skill_md_hash: str,
     expected_entrypoint: str,
@@ -162,6 +164,18 @@ def _scan_installed_skill(
     allow_marker: bool,
 ) -> bool:
     """Synchronously rescan a package with upload-equivalent bounds."""
+    derived_directories = {
+        "/".join(parts[:index])
+        for name in expected_hashes
+        for parts in (name.split("/"),)
+        for index in range(1, len(parts))
+    }
+    if set(expected_directories) != derived_directories or len(
+        expected_directories
+    ) != len(derived_directories):
+        raise SkillConflictError("Skill integrity check failed: directory contract")
+    if len(expected_hashes) + len(derived_directories) > MAX_MATERIALIZED_ENTRIES:
+        raise SkillConflictError("Skill integrity check failed: materialized budget")
     try:
         root_stat = os.lstat(root)
     except OSError as exc:
@@ -171,17 +185,12 @@ def _scan_installed_skill(
     if _is_reparse_point(root_stat):
         raise SkillConflictError("Skill integrity check failed: reparse point")
     root_resolved = root.resolve(strict=True)
-    entries = 0
+    materialized_entries = 0
     files = 0
     total = 0
     marker_present = False
     records: dict[str, tuple[Path, int]] = {}
-    expected_directories = {
-        "/".join(parts[:index])
-        for name in expected_hashes
-        for parts in (name.split("/"),)
-        for index in range(1, len(parts))
-    }
+    expected_directory_set = set(expected_directories)
     aliases: set[str] = set()
     stack = [root]
     while stack:
@@ -192,9 +201,6 @@ def _scan_installed_skill(
             raise SkillConflictError("Skill integrity scan failed") from exc
         with children:
             for child in children:
-                entries += 1
-                if entries > MAX_ENTRIES:
-                    raise SkillConflictError("Skill integrity check failed: too many entries")
                 path = Path(child.path)
                 try:
                     child_stat = child.stat(follow_symlinks=False)
@@ -215,16 +221,23 @@ def _scan_installed_skill(
                         raise SkillConflictError("Skill integrity check failed: invalid marker")
                     marker_present = True
                     continue
+                materialized_entries += 1
+                if materialized_entries > MAX_MATERIALIZED_ENTRIES:
+                    raise SkillConflictError(
+                        "Skill integrity check failed: too many materialized entries"
+                    )
                 try:
                     parts = _safe_member_parts(relative)
                 except SkillPackageError as exc:
                     raise SkillConflictError("Skill integrity check failed: unsafe name") from exc
+                if len(parts) > MAX_PATH_DEPTH:
+                    raise SkillConflictError("Skill integrity check failed: path depth")
                 alias = "/".join(part.casefold() for part in parts)
                 if alias in aliases:
                     raise SkillConflictError("Skill integrity check failed: path alias")
                 aliases.add(alias)
                 if stat.S_ISDIR(child_stat.st_mode):
-                    if relative not in expected_directories:
+                    if relative not in expected_directory_set:
                         raise SkillConflictError(
                             "Skill integrity check failed: file set changed"
                         )
@@ -343,6 +356,7 @@ class SkillService:
             _scan_installed_skill,
             expected,
             expected_hashes=dict(row.file_sha256),
+            expected_directories=tuple(row.expected_directories),
             expected_canonical_hash=row.content_sha256,
             expected_skill_md_hash=row.skill_md_sha256,
             expected_entrypoint=row.entrypoint,
@@ -413,6 +427,7 @@ class SkillService:
                     content_sha256=package.content_sha256,
                     skill_md_sha256=package.skill_md_sha256,
                     file_sha256=package.file_sha256,
+                    expected_directories=list(package.expected_directories),
                     validation_warnings=list(package.warnings),
                     install_path=str(destination),
                 )

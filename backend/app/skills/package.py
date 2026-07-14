@@ -16,7 +16,9 @@ from app.skills.models import SkillManifest, ValidatedSkillPackage
 
 
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
-MAX_ENTRIES = 128
+MAX_ZIP_MEMBERS = 128
+MAX_MATERIALIZED_ENTRIES = 256
+MAX_PATH_DEPTH = 16
 MAX_FILES = 128
 MAX_FILE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 8 * 1024 * 1024
@@ -215,7 +217,7 @@ def validate_skill_zip(
 
     with archive:
         infos = archive.infolist()
-        if len(infos) > MAX_ENTRIES:
+        if len(infos) > MAX_ZIP_MEMBERS:
             raise SkillPackageError("too many ZIP entries in Skill package")
         aliases: dict[str, bool] = {}
         raw_names: set[str] = set()
@@ -228,6 +230,8 @@ def validate_skill_zip(
             if "\x00" in info.orig_filename:
                 raise SkillPackageError("unsafe path in ZIP member")
             parts = _safe_member_parts(info.filename.rstrip("/"))
+            if len(parts) - 1 > MAX_PATH_DEPTH:
+                raise SkillPackageError("Skill path depth exceeds the allowed limit")
             roots.add(parts[0])
             alias = "/".join(part.casefold() for part in parts)
             is_directory = info.is_dir()
@@ -294,6 +298,14 @@ def validate_skill_zip(
 
     if "SKILL.md" not in files or "skill.json" not in files:
         raise SkillPackageError("package requires exactly SKILL.md and skill.json")
+    expected_directories = {
+        "/".join(parts[:index])
+        for name in files
+        for parts in (name.split("/"),)
+        for index in range(1, len(parts))
+    }
+    if len(files) + len(expected_directories) > MAX_MATERIALIZED_ENTRIES:
+        raise SkillPackageError("Skill materialized entry budget is exceeded")
     try:
         files["SKILL.md"].decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -311,5 +323,6 @@ def validate_skill_zip(
         content_sha256=canonical_content_sha256(files),
         skill_md_sha256=file_sha256["SKILL.md"],
         file_sha256=file_sha256,
+        expected_directories=tuple(sorted(expected_directories)),
         warnings=warnings,
     )

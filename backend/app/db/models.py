@@ -152,6 +152,7 @@ class SkillRow(Base):
     content_sha256: Mapped[str] = mapped_column(String(64))
     skill_md_sha256: Mapped[str] = mapped_column(String(64))
     file_sha256: Mapped[dict[str, str]] = mapped_column(JSON)
+    expected_directories: Mapped[list[str]] = mapped_column(JSON, default=list)
     validation_warnings: Mapped[list[str]] = mapped_column(JSON, default=list)
     install_path: Mapped[str] = mapped_column(String(1000))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

@@ -26,7 +26,7 @@ from app.skills.service import (
     SkillPermissionError,
     SkillService as GovernedSkillService,
 )
-from app.skills.package import MAX_FILE_BYTES
+from app.skills.package import MAX_FILE_BYTES, MAX_ZIP_MEMBERS
 
 
 def SkillService(db, install_root):
@@ -47,6 +47,20 @@ def package(version: str = "1.0.0", name: str = "private-demo") -> bytes:
         archive.writestr(f"{name}/SKILL.md", "# demo")
         archive.writestr(f"{name}/skill.json", json.dumps(manifest))
         archive.writestr(f"{name}/main.py", "print('ok')")
+    return output.getvalue()
+
+
+def boundary_package() -> bytes:
+    output = io.BytesIO()
+    manifest = {
+        "id": "boundary-demo", "name": "boundary-demo", "version": "1.0.0",
+        "type": "python", "entrypoint": "d0/main.py",
+    }
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("boundary-demo/SKILL.md", "# Boundary")
+        archive.writestr("boundary-demo/skill.json", json.dumps(manifest))
+        for index in range(MAX_ZIP_MEMBERS - 2):
+            archive.writestr(f"boundary-demo/d{index}/main.py", "pass")
     return output.getvalue()
 
 
@@ -95,6 +109,18 @@ def test_install_publish_authorize_isolate_and_invalidate_cache(tmp_path):
             "skill.install", "skill.publish", "skill.authorize", "skill.disable"
         }
         assert all("manifest" not in row.details and "content" not in row.details for row in audits)
+
+    asyncio.run(scenario(tmp_path, check))
+
+
+def test_near_limit_package_install_idempotent_and_publish_share_budget(tmp_path):
+    async def check(db, users):
+        service = SkillService(db, tmp_path / "installed")
+        admin = principal(users["business_admin01"])
+        upload = boundary_package()
+        installed = await service.install(admin, upload)
+        assert (await service.install(admin, upload)).id == installed.id
+        assert (await service.publish(admin, installed.id)).status == "published"
 
     asyncio.run(scenario(tmp_path, check))
 
@@ -355,8 +381,8 @@ def test_disk_rescan_rejects_oversize_and_excess_entries_without_read_bytes(
         with pytest.raises(SkillConflictError, match="file set"):
             await service.install(admin, package())
         (destination / "unexpected-empty").rmdir()
-        monkeypatch.setattr("app.skills.service.MAX_ENTRIES", 2)
-        with pytest.raises(SkillConflictError, match="entries"):
+        monkeypatch.setattr("app.skills.service.MAX_MATERIALIZED_ENTRIES", 2)
+        with pytest.raises(SkillConflictError, match="materialized"):
             await service.install(admin, package())
 
     from pathlib import Path

@@ -27,4 +27,5 @@ class ValidatedSkillPackage:
     content_sha256: str
     skill_md_sha256: str
     file_sha256: dict[str, str]
+    expected_directories: tuple[str, ...]
     warnings: tuple[str, ...] = ()

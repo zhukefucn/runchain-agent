@@ -8,7 +8,9 @@ import zipfile
 import pytest
 
 from app.skills.package import (
-    MAX_ENTRIES,
+    MAX_MATERIALIZED_ENTRIES,
+    MAX_PATH_DEPTH,
+    MAX_ZIP_MEMBERS,
     SkillPackageError,
     canonical_content_sha256,
     validate_skill_zip,
@@ -58,6 +60,7 @@ def test_valid_skill_zip_returns_manifest_files_and_upload_hash():
     assert len(package.upload_sha256) == 64
     assert len(package.skill_md_sha256) == 64
     assert package.manifest.parameters["type"] == "object"
+    assert package.expected_directories == ()
 
 
 def test_windows_explorer_style_explicit_directories_are_accepted():
@@ -289,7 +292,7 @@ def test_streaming_limits_reject_high_ratio_and_large_content():
 def test_entry_limit_counts_directories_and_file_directory_ancestor_conflicts():
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as archive:
-        for index in range(MAX_ENTRIES + 1):
+        for index in range(MAX_ZIP_MEMBERS + 1):
             archive.writestr(f"root/empty-{index}/", b"")
     with pytest.raises(SkillPackageError, match="entries"):
         validate_skill_zip(output.getvalue())
@@ -302,6 +305,53 @@ def test_entry_limit_counts_directories_and_file_directory_ancestor_conflicts():
     })
     with pytest.raises(SkillPackageError, match="conflict"):
         validate_skill_zip(conflict)
+
+
+def test_materialized_entry_budget_and_path_depth_are_checked_before_install():
+    manifest = {
+        "id": "budget-demo", "name": "budget-demo", "version": "1.0.0",
+        "type": "python", "entrypoint": "d0/e0/main.py",
+    }
+    too_many = {
+        "budget-demo/SKILL.md": "# Budget",
+        "budget-demo/skill.json": json.dumps(manifest),
+    }
+    # Stays below the ZIP member budget while unique implicit ancestors push
+    # the materialized filesystem node count over its independent budget.
+    for index in range(MAX_ZIP_MEMBERS - 2):
+        relative = f"d{index}/e{index}/main.py"
+        too_many[f"budget-demo/{relative}"] = "pass"
+    with pytest.raises(SkillPackageError, match="materialized"):
+        validate_skill_zip(skill_zip(too_many))
+
+    deep_parts = [f"d{index}" for index in range(MAX_PATH_DEPTH)] + ["main.py"]
+    deep_entrypoint = "/".join(deep_parts)
+    deep_manifest = dict(manifest, entrypoint=deep_entrypoint)
+    deep = {
+        "budget-demo/SKILL.md": "# Budget",
+        "budget-demo/skill.json": json.dumps(deep_manifest),
+        f"budget-demo/{deep_entrypoint}": "pass",
+    }
+    with pytest.raises(SkillPackageError, match="depth"):
+        validate_skill_zip(skill_zip(deep))
+
+
+def test_near_file_limit_package_has_immutable_expected_directories():
+    manifest = {
+        "id": "boundary-demo", "name": "boundary-demo", "version": "1.0.0",
+        "type": "python", "entrypoint": "d0/main.py",
+    }
+    files = {
+        "boundary-demo/SKILL.md": "# Boundary",
+        "boundary-demo/skill.json": json.dumps(manifest),
+    }
+    for index in range(MAX_ZIP_MEMBERS - 2):
+        files[f"boundary-demo/d{index}/main.py"] = "pass"
+    package = validate_skill_zip(skill_zip(files))
+    assert len(package.files) + len(package.expected_directories) <= MAX_MATERIALIZED_ENTRIES
+    assert package.expected_directories[0] == "d0"
+    with pytest.raises((AttributeError, TypeError)):
+        package.expected_directories += ("mutated",)
 
 
 def test_unsupported_compression_is_a_domain_error():
