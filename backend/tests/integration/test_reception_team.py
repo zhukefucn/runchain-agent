@@ -234,6 +234,43 @@ async def test_reception_executes_persisted_workers_and_reuses_them(tmp_path):
 
 
 @_async_test
+async def test_subagent_executor_awaits_chat_service_before_mock_tool():
+    from agentscope.app.message_bus import InMemoryMessageBus
+
+    from app.agents.reception import AgentScopeSubagentExecutor
+
+    calls: list[tuple[str, str]] = []
+
+    class ChatService:
+        async def run(self, *, user_id, session_id, agent_id, input_msg=None):
+            assert input_msg is None
+            calls.append(("agent", f"{user_id}:{agent_id}:{session_id}"))
+
+    async def tool(owner_user_id: str, prompt: str):
+        calls.append(("tool", f"{owner_user_id}:{prompt}"))
+        return {"ok": True}
+
+    executor = AgentScopeSubagentExecutor(
+        InMemoryMessageBus(),
+        chat_service_provider=ChatService,
+    )
+    result = await executor.execute(
+        owner_user_id="manager-id",
+        worker_agent_id="worker-id",
+        worker_session_id="worker-session",
+        agent_type="pickup",
+        prompt="receive guests",
+        tool=tool,
+    )
+
+    assert result == {"ok": True}
+    assert calls == [
+        ("agent", "manager-id:worker-id:worker-session"),
+        ("tool", "manager-id:receive guests"),
+    ]
+
+
+@_async_test
 async def test_both_managers_run_independently_and_sse_encoding_is_stable(tmp_path):
     from app.agents.reception import ReceptionTeamRuntime
     from app.agents.sse import encode_sse

@@ -391,6 +391,11 @@ def test_root_app_liveness_readiness_identity_bridge_and_clean_lifespan(tmp_path
                 "DELETE",
                 f"/internal/agentscope/workspace/skill/native{workspace_query}",
             ),
+            ("GET", "/internal/agentscope/credential/"),
+            ("GET", "/internal/agentscope/schedule/"),
+            ("GET", "/internal/agentscope/model/"),
+            ("GET", "/internal/agentscope/tts-model/"),
+            ("GET", "/internal/agentscope/knowledge-base/"),
         )
         for method, path in workspace_requests:
             denied = await client.request(

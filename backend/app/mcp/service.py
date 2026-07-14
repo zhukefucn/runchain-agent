@@ -888,13 +888,35 @@ class McpService:
                 retire_code = "CALL_CANCELLED"
             raise
         finally:
-            if retire_code is not None and runtime is not None:
-                await self._retire_failed_runtime(
-                    actor, server_id, runtime, retire_code
+            await _await_uncancellable(
+                self._finalize_call(
+                    actor=actor,
+                    server_id=server_id,
+                    runtime=runtime,
+                    retire_code=retire_code,
+                    result=result,
+                    request_id=request_id,
                 )
-            await self._audit_call_uncancellable(
-                actor, server_id, result, request_id=request_id
             )
+
+    async def _finalize_call(
+        self,
+        *,
+        actor: Principal,
+        server_id: str,
+        runtime: _Runtime | None,
+        retire_code: str | None,
+        result: str,
+        request_id: str | None,
+    ) -> None:
+        """Finish retirement, state audit, and call audit as one cleanup."""
+        if retire_code is not None and runtime is not None:
+            await self._retire_failed_runtime(
+                actor, server_id, runtime, retire_code
+            )
+        await self._audit_call(
+            actor, server_id, result, request_id=request_id
+        )
 
     async def _retire_failed_runtime(
         self,

@@ -27,7 +27,11 @@ from app.agents.factory import (
     build_runtime_agent_class,
 )
 from app.agents.hitl import HitlService
-from app.agents.reception import ReceptionTeamRuntime, reception_subagent_templates
+from app.agents.reception import (
+    AgentScopeSubagentExecutor,
+    ReceptionTeamRuntime,
+    reception_subagent_templates,
+)
 from app.agentscope_ext.sqlite_storage import (
     RUNTIME_PLACEHOLDER_CREDENTIAL_ID,
     SQLiteStorage,
@@ -421,6 +425,10 @@ def create_root_app(
         storage=storage,
         message_bus=bus,
         workspace_manager=workspace,
+        subagent_executor=AgentScopeSubagentExecutor(
+            bus,
+            chat_service_provider=lambda: agentscope_app.state.chat_service,
+        ),
         governed_tool_provider=governed_reception_tools,
     )
     app.state.hitl_service = HitlService(sessions)
@@ -443,9 +451,16 @@ def create_root_app(
     async def protect_agentscope(request: Request, call_next):
         if not request.url.path.startswith("/internal/agentscope"):
             return await call_next(request)
-        native_workspace_path = "/internal/agentscope/workspace"
-        if request.url.path == native_workspace_path or request.url.path.startswith(
-            native_workspace_path + "/"
+        native_manager_routes = (
+            "/internal/agentscope/chat",
+            "/internal/agentscope/agent",
+            "/internal/agentscope/agents",
+            "/internal/agentscope/sessions",
+        )
+        if not any(
+            request.url.path == route
+            or request.url.path.startswith(route + "/")
+            for route in native_manager_routes
         ):
             return _error(404, "NOT_FOUND", "Endpoint not found")
         _sanitize_identity_scope(request.scope)

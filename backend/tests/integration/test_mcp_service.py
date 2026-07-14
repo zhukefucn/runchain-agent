@@ -750,6 +750,61 @@ def test_repeated_cancel_during_failed_start_finishes_retirement_and_audit(
     asyncio.run(_fault_scenario(tmp_path, check, call_timeout=2))
 
 
+def test_repeated_cancel_during_failed_call_finishes_state_and_both_audits(
+    tmp_path, monkeypatch
+):
+    async def check(service, registry, users, db):
+        import app.mcp.service as mcp_module
+
+        server = await _register_fault(service, users)
+        admin = _principal(users["business_admin01"])
+        manager = _principal(users["manager0001"])
+        await service.authorize(admin, server.id, users["manager0001"].id)
+        await service.start(admin, server.id)
+
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_stop = mcp_module._stop_runtime_process
+
+        async def blocked_stop(runtime):
+            cleanup_entered.set()
+            await release_cleanup.wait()
+            await original_stop(runtime)
+
+        monkeypatch.setattr(mcp_module, "_stop_runtime_process", blocked_stop)
+        call = asyncio.create_task(
+            service.call_tool(manager, server.id, "fault", {"mode": "timeout"})
+        )
+        await cleanup_entered.wait()
+        call.cancel()
+        await asyncio.sleep(0)
+        call.cancel()
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+        assert await registry.current(server.id) is None
+        async with service._sessions() as verify:
+            row = await verify.get(McpServerRow, server.id)
+            assert row.status == "failed" and row.last_error == "CALL_TIMEOUT"
+        lifecycle = list(
+            await db.scalars(
+                select(AuditRecordRow).where(
+                    AuditRecordRow.action == "mcp.lifecycle"
+                )
+            )
+        )
+        calls = list(
+            await db.scalars(
+                select(AuditRecordRow).where(AuditRecordRow.action == "mcp.call")
+            )
+        )
+        assert len(lifecycle) == 1 and lifecycle[0].result == "failure"
+        assert len(calls) == 1 and calls[0].result == "failure"
+
+    asyncio.run(_fault_scenario(tmp_path, check, call_timeout=0.05))
+
+
 def test_cancel_while_waiting_call_slot_does_not_retire_shared_runtime(tmp_path):
     async def check(service, registry, users, db):
         admin = _principal(users["business_admin01"])

@@ -40,8 +40,13 @@ class AgentScopeSubagentExecutor:
     the structured value consumed by this Phase-1 orchestration.
     """
 
-    def __init__(self, message_bus: MessageBus) -> None:
+    def __init__(
+        self,
+        message_bus: MessageBus,
+        chat_service_provider: Callable[[], Any] | None = None,
+    ) -> None:
         self._message_bus = message_bus
+        self._chat_service_provider = chat_service_provider
 
     async def execute(
         self,
@@ -64,12 +69,27 @@ class AgentScopeSubagentExecutor:
             MessageBusKeys.inbox(worker_session_id),
             hint.model_dump(mode="json"),
         )
-        await enqueue_run_trigger(
-            self._message_bus,
-            user_id=owner_user_id,
-            session_id=worker_session_id,
-            agent_id=worker_agent_id,
+        chat_service = (
+            self._chat_service_provider()
+            if self._chat_service_provider is not None
+            else None
         )
+        if chat_service is None:
+            await enqueue_run_trigger(
+                self._message_bus,
+                user_id=owner_user_id,
+                session_id=worker_session_id,
+                agent_id=worker_agent_id,
+            )
+        else:
+            # Await the worker turn so the expert-team run represents actual
+            # completed AgentScope execution, not only a queued wake signal.
+            await chat_service.run(
+                user_id=owner_user_id,
+                session_id=worker_session_id,
+                agent_id=worker_agent_id,
+                input_msg=None,
+            )
         return await tool(owner_user_id, prompt)
 
 
