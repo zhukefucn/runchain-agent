@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import re
 import stat
+import unicodedata
 from pathlib import Path, PureWindowsPath
 from typing import Protocol
 
@@ -16,16 +19,21 @@ _WINDOWS_RESERVED_NAMES = {
     "AUX",
     "NUL",
     "CLOCK$",
+    "CONIN$",
+    "CONOUT$",
     *(f"COM{number}" for number in range(1, 10)),
     *(f"LPT{number}" for number in range(1, 10)),
 }
 _WINDOWS_FORBIDDEN_CHARS = frozenset('<>:"/\\|?*')
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_IDENTIFIER_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,127}\Z", re.ASCII)
+logger = logging.getLogger(__name__)
 
 
 class SessionIdentity(Protocol):
     owner_user_id: str
     agent_id: str
+    session_id: str
 
 
 class SessionOwnerResolver(Protocol):
@@ -34,12 +42,15 @@ class SessionOwnerResolver(Protocol):
     ) -> SessionIdentity | None: ...
 
 
-def _validate_segment(value: str, *, field: str) -> str:
-    """Validate an untrusted identifier before using it as one path segment."""
+def _reject_windows_alias(
+    value: str, *, field: str, require_lowercase_ascii: bool
+) -> None:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be a non-empty string")
-    if len(value) > 100:
-        raise ValueError(f"{field} exceeds the maximum identifier length")
+    if unicodedata.normalize("NFKC", value) != value:
+        raise ValueError(f"{field} must already be NFKC-normalized")
+    if require_lowercase_ascii and value.casefold() != value:
+        raise ValueError(f"{field} must use canonical lowercase ASCII")
     if any(ord(character) < 32 for character in value):
         raise ValueError(f"{field} contains a control character")
     if any(character in _WINDOWS_FORBIDDEN_CHARS for character in value):
@@ -53,6 +64,21 @@ def _validate_segment(value: str, *, field: str) -> str:
     device_stem = value.split(".", 1)[0].upper()
     if device_stem in _WINDOWS_RESERVED_NAMES:
         raise ValueError(f"{field} is a reserved Windows device name")
+
+
+def _validate_segment(value: str, *, field: str) -> str:
+    """Validate a canonical identifier used as exactly one path segment."""
+    _reject_windows_alias(value, field=field, require_lowercase_ascii=True)
+    if _IDENTIFIER_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{field} must be canonical lowercase ASCII")
+    return value
+
+
+def _validate_path_segment(value: str, *, field: str) -> str:
+    """Validate a stable normal filename/directory segment."""
+    _reject_windows_alias(value, field=field, require_lowercase_ascii=False)
+    if len(value) > 255:
+        raise ValueError(f"{field} exceeds the filesystem segment limit")
     return value
 
 
@@ -64,6 +90,20 @@ def _is_reparse_point(path: Path) -> bool:
     except OSError:
         return False
     return bool(attributes & _REPARSE_POINT)
+
+
+def _canonicalize_root(root: str | os.PathLike[str]) -> Path:
+    """Reject reparse components before resolving the configured root."""
+    expanded = os.path.expanduser(os.fspath(root))
+    unresolved = Path(os.path.abspath(expanded))
+    current = Path(unresolved.anchor)
+    if _is_reparse_point(current):
+        raise ValueError("workspace root path crosses a reparse point")
+    for part in unresolved.parts[1:]:
+        current = current / part
+        if _is_reparse_point(current):
+            raise ValueError("workspace root path crosses a reparse point")
+    return unresolved.resolve(strict=False)
 
 
 def _reject_existing_reparse_points(root: Path, candidate: Path) -> None:
@@ -111,7 +151,7 @@ class ManagerLocalWorkspaceManager(WorkspaceManagerBase):
         skill_paths: list[str] | None = None,
     ) -> None:
         super().__init__(isolation=IsolationPolicy.PER_AGENT)
-        self.root = Path(root).expanduser().resolve(strict=False)
+        self.root = _canonicalize_root(root)
         self._session_resolver = session_resolver
         self._default_mcps = list(default_mcps or [])
         self._skill_paths = list(skill_paths or [])
@@ -140,7 +180,8 @@ class ManagerLocalWorkspaceManager(WorkspaceManagerBase):
         if not parts:
             raise ValueError("relative_path must name a path")
         safe_parts = [
-            _validate_segment(part, field="relative_path segment") for part in parts
+            _validate_path_segment(part, field="relative_path segment")
+            for part in parts
         ]
 
         user_root = (self.root / safe_user_id).resolve(strict=False)
@@ -164,10 +205,28 @@ class ManagerLocalWorkspaceManager(WorkspaceManagerBase):
         binding = await self._session_resolver.resolve_session(
             safe_user_id, safe_session_id
         )
+        if binding is not None:
+            try:
+                bound_owner = _validate_segment(
+                    binding.owner_user_id, field="resolved owner_user_id"
+                )
+                bound_agent = _validate_segment(
+                    binding.agent_id, field="resolved agent_id"
+                )
+                bound_session = _validate_segment(
+                    binding.session_id, field="resolved session_id"
+                )
+            except (AttributeError, ValueError) as exc:
+                raise PermissionError(
+                    "session resolver returned an unsafe binding"
+                ) from exc
+        else:
+            bound_owner = bound_agent = bound_session = None
         if (
             binding is None
-            or binding.owner_user_id != safe_user_id
-            or binding.agent_id != safe_agent_id
+            or bound_owner != safe_user_id
+            or bound_agent != safe_agent_id
+            or bound_session != safe_session_id
         ):
             raise PermissionError("session does not belong to this manager and agent")
 
@@ -189,7 +248,7 @@ class ManagerLocalWorkspaceManager(WorkspaceManagerBase):
         cache_key = (safe_user_id, safe_agent_id, safe_workspace_id)
         session_dir = self.resolve_manager_path(
             safe_user_id,
-            Path("agents") / safe_agent_id / "sessions" / safe_session_id,
+            Path("sessions") / safe_session_id,
         )
 
         async with self._lock:
@@ -223,18 +282,25 @@ class ManagerLocalWorkspaceManager(WorkspaceManagerBase):
             for key, _ in matching:
                 self._cache.pop(key)
         await asyncio.gather(
-            *(workspace.close() for _, workspace in matching),
-            return_exceptions=True,
+            *(self._safe_close(workspace) for _, workspace in matching)
         )
 
     async def close_all(self) -> None:
         async with self._lock:
             workspaces = list(self._cache.values())
             self._cache.clear()
-        await asyncio.gather(
-            *(workspace.close() for workspace in workspaces),
-            return_exceptions=True,
-        )
+        await asyncio.gather(*(self._safe_close(workspace) for workspace in workspaces))
+
+    @staticmethod
+    async def _safe_close(workspace: LocalWorkspace) -> None:
+        try:
+            await workspace.close()
+        except Exception:
+            logger.warning(
+                "Failed to close manager workspace %s",
+                workspace.workspace_id,
+                exc_info=True,
+            )
 
 
 __all__ = ["ManagerLocalWorkspaceManager", "SessionOwnerResolver"]
