@@ -566,3 +566,31 @@ class SkillService:
             async with self._read_session_factory() as read_session:
                 rows = await SkillRepository(read_session).effective(user_id)
                 return tuple(_metadata(row) for row in rows)
+
+    async def resolve_execution_skill(
+        self, user_id: str, skill_id: str, version: str | None = None
+    ) -> EffectiveSkill:
+        """Resolve one effective Skill and recheck its bounded disk integrity.
+
+        Absence, disabled/unpublished state, wrong manager authorization, and a
+        version mismatch intentionally share one not-found result so callers do
+        not gain an authorization oracle. The policy lock makes governance state
+        changes atomic with this snapshot; the controlled runner documents the
+        remaining same-account filesystem TOCTOU boundary after this scan.
+        """
+        async with _policy_lock_for_running_loop():
+            async with self._read_session_factory() as read_session:
+                rows = await SkillRepository(read_session).effective(user_id)
+                row = next(
+                    (
+                        candidate
+                        for candidate in rows
+                        if candidate.id == skill_id
+                        and (version is None or candidate.version == version)
+                    ),
+                    None,
+                )
+                if row is None:
+                    raise SkillNotFoundError(skill_id)
+                await self._verify_integrity(row)
+                return _metadata(row)

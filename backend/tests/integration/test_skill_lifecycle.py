@@ -18,12 +18,15 @@ from app.db.seed import seed_demo_data
 from app.db.session import build_async_engine, create_schema
 from app.repositories.audit import AuditRepository
 from app.repositories.skill import SkillRepository
+from app.runner.protocol import SkillExecutionRequest, SkillResolutionError
+from app.runner.resolver import SkillServiceResolver
 from app.skills.service import (
     UNCOMMITTED_MARKER,
     EffectiveSkill,
     SkillCleanupError,
     SkillConflictError,
     SkillPermissionError,
+    SkillNotFoundError,
     SkillService as GovernedSkillService,
 )
 from app.skills.package import MAX_FILE_BYTES, MAX_ZIP_MEMBERS
@@ -109,6 +112,53 @@ def test_install_publish_authorize_isolate_and_invalidate_cache(tmp_path):
             "skill.install", "skill.publish", "skill.authorize", "skill.disable"
         }
         assert all("manifest" not in row.details and "content" not in row.details for row in audits)
+
+    asyncio.run(scenario(tmp_path, check))
+
+
+def test_execution_resolution_rechecks_authorization_version_and_disk_integrity(tmp_path):
+    async def check(db, users):
+        service = SkillService(db, tmp_path / "installed")
+        admin = principal(users["business_admin01"])
+        skill = await service.install(admin, package())
+        await service.publish(admin, skill.id)
+        await service.authorize(admin, skill.id, users["manager0001"].id)
+
+        resolved = await service.resolve_execution_skill(
+            users["manager0001"].id, skill.id, "1.0.0"
+        )
+        assert resolved.id == skill.id
+        assert resolved.type == "python"
+        request = SkillExecutionRequest(
+            user_id=users["manager0001"].id,
+            skill_id=skill.id,
+            version="1.0.0",
+            input_data={},
+            request_id="resolve-test",
+        )
+        runner_skill = await SkillServiceResolver(service).resolve(request)
+        assert runner_skill.entrypoint == (
+            tmp_path / "installed" / "private-demo" / "1.0.0" / "main.py"
+        ).resolve()
+
+        with pytest.raises(SkillNotFoundError):
+            await service.resolve_execution_skill(
+                users["manager0002"].id, skill.id, "1.0.0"
+            )
+        with pytest.raises(SkillNotFoundError):
+            await service.resolve_execution_skill(
+                users["manager0001"].id, skill.id, "2.0.0"
+            )
+
+        (tmp_path / "installed" / "private-demo" / "1.0.0" / "main.py").write_text(
+            "print('tampered')", encoding="utf-8"
+        )
+        with pytest.raises(SkillConflictError, match="integrity"):
+            await service.resolve_execution_skill(
+                users["manager0001"].id, skill.id, "1.0.0"
+            )
+        with pytest.raises(SkillResolutionError):
+            await SkillServiceResolver(service).resolve(request)
 
     asyncio.run(scenario(tmp_path, check))
 
@@ -280,6 +330,7 @@ def test_postcommit_marker_removal_failure_keeps_committed_row_quarantined(
     async def check(db, users):
         service = SkillService(db, tmp_path / "installed")
         original_unlink = Path.unlink
+        upload = package()
 
         def locked_marker(path, *args, **kwargs):
             if path.name == UNCOMMITTED_MARKER:
@@ -288,7 +339,7 @@ def test_postcommit_marker_removal_failure_keeps_committed_row_quarantined(
 
         monkeypatch.setattr(Path, "unlink", locked_marker)
         with pytest.raises(SkillCleanupError, match="finalize"):
-            await service.install(principal(users["business_admin01"]), package())
+            await service.install(principal(users["business_admin01"]), upload)
         row = await db.scalar(select(SkillRow))
         assert row is not None
         assert (Path(row.install_path) / UNCOMMITTED_MARKER).is_file()
@@ -297,7 +348,7 @@ def test_postcommit_marker_removal_failure_keeps_committed_row_quarantined(
             await service.publish(principal(users["business_admin01"]), row.id)
         monkeypatch.setattr(Path, "unlink", original_unlink)
         recovered = await service.install(
-            principal(users["business_admin01"]), package()
+            principal(users["business_admin01"]), upload
         )
         assert recovered.id == row.id
         assert not (Path(row.install_path) / UNCOMMITTED_MARKER).exists()
