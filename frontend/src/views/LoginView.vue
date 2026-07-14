@@ -10,6 +10,11 @@ const error = ref("");
 const auth = useAuthStore();
 const router = useRouter();
 
+function fillManagerDemoCredentials() {
+  username.value = "manager0001";
+  password.value = "12345678";
+}
+
 async function submit() {
   error.value = "";
   try {
@@ -36,7 +41,7 @@ async function submit() {
         <label>密码<input v-model="password" aria-label="密码" autocomplete="current-password" type="password" placeholder="输入登录密码" /></label>
         <p v-if="error" class="alert error" role="alert">{{ error }}</p>
         <button class="button primary full" :disabled="auth.loading">{{ auth.loading ? '正在验证…' : '安全登录' }}</button>
-        <div class="demo-accounts"><strong>演示账号</strong><p>客户经理：manager0001 / manager0002</p><p>业务管理员：business_admin01</p><p>系统管理员：system_admin01</p><small>以上账号初始密码均为 12345678</small></div>
+        <div class="demo-accounts"><strong>演示账号</strong><p>客户经理：manager0001 / manager0002</p><p>业务管理员：business_admin01</p><p>系统管理员：system_admin01</p><small>以上账号初始密码均为 12345678</small><button type="button" class="button secondary compact full" @click="fillManagerDemoCredentials">填入 manager0001 演示账号</button></div>
       </form>
     </section>
   </main>
