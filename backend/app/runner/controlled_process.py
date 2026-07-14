@@ -5,6 +5,8 @@ import ctypes
 from dataclasses import dataclass
 import inspect
 import json
+import logging
+import math
 import os
 from pathlib import Path
 import shutil
@@ -15,6 +17,7 @@ import tempfile
 import threading
 import time
 from typing import Any, Callable
+from uuid import uuid4
 
 from app.runner.protocol import (
     ResolvedSkill,
@@ -24,6 +27,13 @@ from app.runner.protocol import (
     SkillResolutionError,
     TrustedSkillResolver,
 )
+from app.runner.windows_acl import (
+    secure_runner_root,
+    verify_inherited_call_directory,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 def _reject_non_finite_json(value: str) -> None:
@@ -38,6 +48,10 @@ class RunnerLimits:
     max_stderr_bytes: int = 32 * 1024
     max_processes: int = 4
     max_memory_bytes: int = 256 * 1024 * 1024
+    max_concurrent_executions: int = 4
+    queue_timeout_seconds: float = 5.0
+    max_json_depth: int = 64
+    max_json_nodes: int = 10_000
 
     def __post_init__(self) -> None:
         bounds = (
@@ -47,6 +61,10 @@ class RunnerLimits:
             ("max_stderr_bytes", self.max_stderr_bytes, 2, 256 * 1024),
             ("max_processes", self.max_processes, 1, 8),
             ("max_memory_bytes", self.max_memory_bytes, 64 * 1024 * 1024, 1024**3),
+            ("max_concurrent_executions", self.max_concurrent_executions, 1, 16),
+            ("queue_timeout_seconds", self.queue_timeout_seconds, 0.01, 60.0),
+            ("max_json_depth", self.max_json_depth, 1, 128),
+            ("max_json_nodes", self.max_json_nodes, 1, 100_000),
         )
         for name, value, minimum, maximum in bounds:
             if isinstance(value, bool) or not minimum <= value <= maximum:
@@ -61,6 +79,40 @@ class _ProcessOutcome:
     duration_ms: int
     exit_code: int | None
     cleanup_ok: bool
+
+
+_gate_loop: asyncio.AbstractEventLoop | None = None
+_shared_gates: dict[str, tuple[int, asyncio.BoundedSemaphore]] = {}
+
+
+def _shared_gate(root: Path, limit: int) -> asyncio.BoundedSemaphore:
+    """Return the process-wide, single-live-loop gate for one runner root."""
+    global _gate_loop, _shared_gates
+    loop = asyncio.get_running_loop()
+    if _gate_loop is not loop:
+        _gate_loop = loop
+        _shared_gates = {}
+    key = os.path.normcase(str(root))
+    existing = _shared_gates.get(key)
+    if existing is not None:
+        existing_limit, gate = existing
+        if existing_limit != limit:
+            raise RuntimeError("runner root has conflicting concurrency limits")
+        return gate
+    gate = asyncio.BoundedSemaphore(limit)
+    _shared_gates[key] = (limit, gate)
+    return gate
+
+
+async def _wait_uncancellable(task: asyncio.Task):
+    """Wait for a cleanup task while deferring any repeated cancellation."""
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
+            continue
 
 
 class _BoundedReader:
@@ -143,6 +195,18 @@ if os.name == "nt":
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
+    class _BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_longlong),
+            ("TotalKernelTime", ctypes.c_longlong),
+            ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+            ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
+
 
 class _WindowsJob:
     """Job Object wrapper that assigns a still-suspended child, closing races."""
@@ -178,6 +242,14 @@ class _WindowsJob:
         self._kernel32.TerminateJobObject.restype = wintypes.BOOL
         self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         self._kernel32.CloseHandle.restype = wintypes.BOOL
+        self._kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        self._kernel32.QueryInformationJobObject.restype = wintypes.BOOL
         self._ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
         self._ntdll.NtResumeProcess.restype = ctypes.c_long
         self._handle = self._kernel32.CreateJobObjectW(None, None)
@@ -225,10 +297,45 @@ class _WindowsJob:
             return True
         return bool(self._kernel32.TerminateJobObject(self._handle, 1))
 
-    def close(self) -> None:
+    def active_processes(self) -> int | None:
+        if not self._handle:
+            return 0
+        info = _BASIC_ACCOUNTING_INFORMATION()
+        returned = wintypes.DWORD()
+        if not self._kernel32.QueryInformationJobObject(
+            self._handle,
+            1,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            ctypes.byref(returned),
+        ):
+            return None
+        return int(info.ActiveProcesses)
+
+    def terminate_remaining(self, timeout: float = 5.0) -> bool:
+        active = self.active_processes()
+        if active is None:
+            return False
+        if active and not self.terminate():
+            return False
+        deadline = time.monotonic() + timeout
+        while active:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+            active = self.active_processes()
+            if active is None:
+                return False
+        return True
+
+    def close(self) -> bool:
         if self._handle:
-            self._kernel32.CloseHandle(self._handle)
+            if not self._kernel32.CloseHandle(self._handle):
+                error = ctypes.get_last_error()
+                logger.error("CloseHandle(Job Object) failed with WinError %d", error)
+                return False
             self._handle = None
+        return True
 
 
 class SkillExecutor:
@@ -253,7 +360,7 @@ class SkillExecutor:
         audit_sink: Callable[[RunnerAuditEvent], Any] | None = None,
     ) -> None:
         self._resolver = resolver
-        self._runner_root = Path(runner_root).resolve()
+        self._runner_root = Path(runner_root).absolute()
         self._limits = limits or RunnerLimits()
         self._audit_sink = audit_sink
 
@@ -295,33 +402,59 @@ class SkillExecutor:
             await self._audit(request, result)
             return result
 
+        gate = _shared_gate(
+            self._runner_root, self._limits.max_concurrent_executions
+        )
+        try:
+            await asyncio.wait_for(
+                gate.acquire(), timeout=self._limits.queue_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            result = self._result(
+                "queue_timeout", started, "Skill execution queue timed out."
+            )
+            await self._audit(request, result)
+            return result
+
         cancel_event = threading.Event()
         worker = asyncio.create_task(
             asyncio.to_thread(self._run_sync, entrypoint, payload, cancel_event)
         )
         try:
-            outcome = await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancel_event.set()
             try:
+                outcome = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancel_event.set()
                 try:
-                    outcome = await asyncio.shield(worker)
-                    cancelled_result = self._convert_outcome(outcome)
-                except Exception:
-                    cancelled_result = self._result(
-                        "failed", started, "Skill process failed."
+                    try:
+                        outcome = await _wait_uncancellable(worker)
+                        cancelled_result = self._convert_outcome(outcome)
+                    except Exception:
+                        cancelled_result = self._result(
+                            "failed", started, "Skill process failed."
+                        )
+                    audit_task = asyncio.create_task(
+                        self._audit(request, cancelled_result)
                     )
-                await self._audit(request, cancelled_result)
-            finally:
-                raise
-        except Exception:
-            result = self._result("failed", started, "Skill process failed.")
+                    try:
+                        await _wait_uncancellable(audit_task)
+                    except Exception:
+                        logger.exception("Runner cancellation audit failed")
+                finally:
+                    raise
+            except Exception:
+                result = self._result("failed", started, "Skill process failed.")
+                await self._audit(request, result)
+                return result
+
+            try:
+                result = self._convert_outcome(outcome)
+            except Exception:
+                result = self._result("failed", started, "Skill process failed.")
             await self._audit(request, result)
             return result
-
-        result = self._convert_outcome(outcome)
-        await self._audit(request, result)
-        return result
+        finally:
+            gate.release()
 
     def _canonical_entrypoint(self, skill: ResolvedSkill) -> Path | None:
         root = Path(skill.install_root).resolve()
@@ -377,9 +510,15 @@ class SkillExecutor:
         stderr_size = 0
         exit_code: int | None = None
         try:
-            self._runner_root.mkdir(parents=True, exist_ok=True)
-            call_dir = Path(tempfile.mkdtemp(prefix="call-", dir=self._runner_root))
-            os.chmod(call_dir, 0o700)
+            secure_runner_root(self._runner_root)
+            if os.name == "nt":
+                call_dir = self._runner_root / f"call-{uuid4().hex}"
+                call_dir.mkdir()
+            else:
+                call_dir = Path(
+                    tempfile.mkdtemp(prefix="call-", dir=self._runner_root)
+                )
+            verify_inherited_call_directory(call_dir)
             # ``-I`` implies ``-E``, so PYTHONUTF8/PYTHONIOENCODING are ignored.
             # Force UTF-8 with an interpreter option to keep JSON bytes portable.
             argv = [
@@ -397,9 +536,7 @@ class SkillExecutor:
                 except BaseException:
                     self._fail_closed_process(process, job)
                     process.wait(timeout=5)
-                    return _ProcessOutcome(
-                        "failed", b"", 0, self._elapsed(started), process.returncode, True
-                    )
+                    raise RuntimeError("Windows Job Object setup failed")
 
             assert process.stdin and process.stdout and process.stderr
             stdout_overflow = threading.Event()
@@ -451,7 +588,11 @@ class SkillExecutor:
             exit_code = process.returncode
             stdout = bytes(stdout_reader.data)
             stderr_size = stderr_reader.size
-            if stdout_reader.error or stderr_reader.error:
+            if stdout_overflow.is_set():
+                status = "output_limit"
+            elif stderr_overflow.is_set():
+                status = "stderr_limit"
+            elif stdout_reader.error or stderr_reader.error:
                 status = "failed"
             elif status == "failed" and not cancel_event.is_set():
                 status = "success" if exit_code == 0 else "failed"
@@ -461,7 +602,8 @@ class SkillExecutor:
             status = "failed"
         finally:
             if job is not None:
-                job.close()
+                cleanup_ok = job.terminate_remaining() and cleanup_ok
+                cleanup_ok = job.close() and cleanup_ok
             if call_dir is not None:
                 try:
                     shutil.rmtree(call_dir)
@@ -510,7 +652,7 @@ class SkillExecutor:
     def _convert_outcome(self, outcome: _ProcessOutcome) -> SkillExecutionResult:
         if not outcome.cleanup_ok:
             return SkillExecutionResult(
-                status="failed",
+                status="cleanup_failed",
                 output=None,
                 stderr_summary="Skill process cleanup failed.",
                 duration_ms=outcome.duration_ms,
@@ -533,7 +675,14 @@ class SkillExecutor:
         try:
             text = outcome.stdout.decode("utf-8", errors="strict")
             output = json.loads(text, parse_constant=_reject_non_finite_json)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            self._validate_json_shape(output)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+            MemoryError,
+        ):
             return SkillExecutionResult(
                 status="invalid_output",
                 output=None,
@@ -548,6 +697,34 @@ class SkillExecutor:
             duration_ms=outcome.duration_ms,
             exit_code=outcome.exit_code,
         )
+
+    def _validate_json_shape(self, output: Any) -> None:
+        stack: list[tuple[Any, int]] = [(output, 1)]
+        nodes = 0
+        while stack:
+            value, depth = stack.pop()
+            nodes += 1
+            if nodes > self._limits.max_json_nodes or depth > self._limits.max_json_depth:
+                raise ValueError("JSON output exceeds structural budget")
+            if value is None or type(value) in (bool, int, str):
+                continue
+            if type(value) is float:
+                if not math.isfinite(value):
+                    raise ValueError("JSON number must be finite")
+                continue
+            if type(value) is list:
+                if nodes + len(stack) + len(value) > self._limits.max_json_nodes:
+                    raise ValueError("JSON output exceeds node budget")
+                stack.extend((item, depth + 1) for item in value)
+                continue
+            if type(value) is dict:
+                if not all(type(key) is str for key in value):
+                    raise ValueError("JSON object keys must be strings")
+                if nodes + len(stack) + len(value) > self._limits.max_json_nodes:
+                    raise ValueError("JSON output exceeds node budget")
+                stack.extend((item, depth + 1) for item in value.values())
+                continue
+            raise ValueError("unsupported JSON output type")
 
     async def _audit(
         self, request: SkillExecutionRequest, result: SkillExecutionResult

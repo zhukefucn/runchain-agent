@@ -9,11 +9,13 @@ from typing import Any, Literal, Protocol
 ExecutionStatus = Literal[
     "success",
     "failed",
+    "cleanup_failed",
     "timeout",
     "output_limit",
     "stderr_limit",
     "invalid_output",
     "invalid_input",
+    "queue_timeout",
     "not_authorized",
     "unsupported_skill_type",
 ]
