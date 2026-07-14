@@ -290,7 +290,22 @@ def test_root_app_liveness_readiness_identity_bridge_and_clean_lifespan(tmp_path
         assert app.state.mcp_registry.closed is True
 
     async def check(client, app, settings):
+        from agentscope.agent import ContextConfig, ReActConfig
+        from agentscope.app._router._session import stream_session_events
+        from agentscope.app.storage import (
+            AgentData,
+            AgentRecord,
+            ChatModelConfig,
+            SessionConfig,
+        )
+        from agentscope.credential import OpenAICredential
+
         assert (await client.get("/api/health")).json() == {"status": "ok"}
+        settings.model_api_key = SimpleNamespace(
+            get_secret_value=lambda: (_ for _ in ()).throw(
+                AssertionError("readiness must not unseal model credentials")
+            )
+        )
         ready = await client.get("/api/ready")
         assert ready.status_code == 200
         assert ready.json()["status"] == "ready"
@@ -311,6 +326,96 @@ def test_root_app_liveness_readiness_identity_bridge_and_clean_lifespan(tmp_path
         )
         assert response.status_code == 200
         assert (await client.get("/internal/agentscope/agent/", headers={"X-User-ID": principal.user_id})).status_code == 401
+
+        # Exercise AgentScope's native ChatService, not only our model factory.
+        agent_id = "native-fake-agent"
+        session_id = "native-fake-session"
+        credential_id = await app.state.storage.upsert_credential(
+            principal.user_id,
+            OpenAICredential(
+                name="placeholder-only",
+                api_key="unused",
+                base_url="https://example.invalid/v1",
+            ),
+        )
+        await app.state.storage.upsert_agent(
+            principal.user_id,
+            AgentRecord(
+                id=agent_id,
+                user_id=principal.user_id,
+                data=AgentData(
+                    name="Native fake",
+                    context_config=ContextConfig(),
+                    react_config=ReActConfig(),
+                ),
+            ),
+        )
+        await app.state.storage.upsert_session(
+            principal.user_id,
+            agent_id,
+            SessionConfig(
+                workspace_id=app.state.workspace_manager.assign_workspace_id(
+                    user_id=principal.user_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                ),
+                chat_model_config=ChatModelConfig(
+                    type="openai_credential",
+                    credential_id=credential_id,
+                    model="must-not-be-called",
+                    parameters={},
+                ),
+            ),
+            session_id=session_id,
+        )
+
+        # Subscribe through the actual SSE endpoint before the run; AgentScope
+        # deliberately trims a completed run's replay buffer.
+        stream = await stream_session_events(
+            session_id,
+            agent_id=agent_id,
+            user_id=principal.user_id,
+            storage=app.state.storage,
+            message_bus=app.state.message_bus,
+        )
+
+        async def receive_fake_event():
+            async for event in stream.body_iterator:
+                if "fake: hello native" in event:
+                    return event
+
+        sse_event = asyncio.create_task(receive_fake_event())
+        await asyncio.sleep(0.02)
+        started = await client.post(
+            "/internal/agentscope/chat/"
+            "?user_id=forged&owner_user_id=forged&role=system_admin",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-User-ID": "forged",
+                "X-Owner-User-ID": "forged",
+                "X-Role": "system_admin",
+            },
+            json={
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "input": UserMsg("user", "hello native").model_dump(mode="json"),
+            },
+        )
+        assert started.status_code == 200, started.text
+        messages = []
+        for _ in range(100):
+            messages = await app.state.storage.list_messages(
+                principal.user_id, session_id
+            )
+            if "fake: hello native" in json.dumps(
+                [item.model_dump(mode="json") for item in messages]
+            ):
+                break
+            await asyncio.sleep(0.02)
+        serialized = json.dumps([item.model_dump(mode="json") for item in messages])
+        assert "fake: hello native" in serialized
+        assert "fake: hello native" in await asyncio.wait_for(sse_event, 2)
+        await stream.body_iterator.aclose()
 
         manager2_token = (await client.post(
             "/api/auth/login",
@@ -352,6 +457,9 @@ def test_root_app_liveness_readiness_identity_bridge_and_clean_lifespan(tmp_path
         settings.workspace_root = unavailable
         failed = await client.get("/api/ready")
         assert failed.status_code == 503
+        assert failed.json()["code"] == "NOT_READY"
+        assert failed.json()["message"]
+        assert failed.json()["request_id"] == failed.headers["X-Request-ID"]
         assert failed.json()["components"]["workspace"]["status"] == "failed"
         assert str(tmp_path) not in failed.text
         settings.workspace_root = original_workspace
@@ -383,3 +491,65 @@ def test_root_app_disposes_engine_when_startup_fails(monkeypatch, tmp_path):
 
     asyncio.run(scenario())
     dispose.assert_awaited_once()
+
+
+def test_root_app_passes_subagent_templates_and_sanitizes_identity_scope(tmp_path):
+    from app.main import _sanitize_identity_scope, create_root_app
+
+    template = SimpleNamespace(type="pickup")
+    app = create_root_app(
+        _settings(tmp_path), custom_subagent_templates=[template]
+    )
+    assert app.state.agentscope_app.state.custom_subagent_templates == {
+        "pickup": template
+    }
+
+    for scope_type in ("http", "websocket"):
+        scope = {
+            "type": scope_type,
+            "path": "/internal/agentscope/chat/",
+            "headers": [
+                (b"x-user-id", b"forged"),
+                (b"x-owner-user-id", b"forged"),
+                (b"x-role", b"system_admin"),
+                (b"authorization", b"Bearer trusted"),
+            ],
+            "query_string": (
+                b"user_id=forged&owner_user_id=forged&role=system_admin&agent_id=a"
+            ),
+        }
+        _sanitize_identity_scope(scope)
+        assert scope["headers"] == [(b"authorization", b"Bearer trusted")]
+        assert scope["query_string"] == b"agent_id=a"
+
+
+def test_uncancellable_cleanup_finishes_after_repeated_cancellation():
+    from app.main import _await_uncancellable
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+        events = []
+
+        async def cleanup():
+            started.set()
+            await release.wait()
+            events.append("registry-terminal")
+            finished.set()
+            events.append("engine-disposed")
+
+        task = asyncio.create_task(_await_uncancellable(cleanup()))
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+        assert events == ["registry-terminal", "engine-disposed"]
+
+    asyncio.run(scenario())

@@ -30,6 +30,14 @@ _IDENTIFIER_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,127}\Z", re.ASCII)
 logger = logging.getLogger(__name__)
 
 
+class _ManagerLocalWorkspace(LocalWorkspace):
+    """Local AgentScope workspace with an explicit no-helper glob contract."""
+
+    @property
+    def _glob_helper_path(self) -> None:
+        return None
+
+
 class SessionIdentity(Protocol):
     owner_user_id: str
     agent_id: str
@@ -260,7 +268,7 @@ class ManagerLocalWorkspaceManager(WorkspaceManagerBase):
             workdir = self.resolve_manager_path(
                 safe_user_id, Path("agents") / safe_agent_id
             )
-            workspace = LocalWorkspace(
+            workspace = _ManagerLocalWorkspace(
                 workdir=str(workdir),
                 workspace_id=safe_workspace_id,
                 default_mcps=self._default_mcps,

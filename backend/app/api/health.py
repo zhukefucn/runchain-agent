@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -46,9 +47,7 @@ async def ready(request: Request):
             components[key] = _safe_component(False, "local root unavailable")
 
     settings = request.app.state.settings
-    model_ok = bool(settings.model_name) and (
-        settings.app_env == "test" or bool(settings.model_api_key.get_secret_value())
-    )
+    model_ok = bool(getattr(request.app.state, "model_configured", False))
     components["model"] = _safe_component(
         model_ok,
         "fake model configured" if settings.app_env == "test" else "real model configured",
@@ -62,8 +61,21 @@ async def ready(request: Request):
         "runner isolation controls verified",
     )
     ok = all(item["status"] == "ok" for item in components.values())
-    payload = {"status": "ready" if ok else "not_ready", "components": components}
-    return JSONResponse(payload, status_code=200 if ok else 503)
+    if ok:
+        return JSONResponse({"status": "ready", "components": components})
+    request_id = getattr(request.state, "request_id", str(uuid4()))
+    payload = {
+        "code": "NOT_READY",
+        "message": "Service dependencies are not ready",
+        "request_id": request_id,
+        "status": "not_ready",
+        "components": components,
+    }
+    return JSONResponse(
+        payload,
+        status_code=503,
+        headers={"X-Request-ID": request_id},
+    )
 
 
 __all__ = ["router"]

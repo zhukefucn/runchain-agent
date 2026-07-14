@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Mapping
+from urllib.parse import parse_qsl, urlencode
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -17,7 +20,10 @@ from agentscope.app import create_app as create_agentscope_app
 from agentscope.app import deps as agentscope_deps
 from agentscope.app.message_bus import InMemoryMessageBus
 
-from app.agents.factory import build_model
+from app.agents.factory import (
+    build_model_runtime,
+    build_runtime_agent_class,
+)
 from app.agentscope_ext.sqlite_storage import SQLiteStorage
 from app.agentscope_ext.workspace_manager import ManagerLocalWorkspaceManager
 from app.api.auth import router as auth_router
@@ -60,7 +66,11 @@ class _SessionResolver:
             row = await db.get(SessionRecordRow, (owner_user_id, session_id))
             if row is None:
                 return None
-            return row
+            return SimpleNamespace(
+                owner_user_id=row.owner_user_id,
+                agent_id=row.agent_id,
+                session_id=row.id,
+            )
 
 
 def _error(status_code: int, code: str, message: str) -> JSONResponse:
@@ -72,9 +82,64 @@ def _error(status_code: int, code: str, message: str) -> JSONResponse:
     )
 
 
+_IDENTITY_HEADERS = {b"x-user-id", b"x-owner-user-id", b"x-role"}
+_IDENTITY_QUERY_KEYS = {"user_id", "owner_user_id", "role"}
+
+
+def _sanitize_identity_scope(scope: dict[str, Any]) -> None:
+    """Delete every client-controlled identity hint before dispatch."""
+    if scope.get("type") not in {"http", "websocket"} or not scope.get(
+        "path", ""
+    ).startswith("/internal/agentscope"):
+        return
+    scope["headers"] = [
+        (key, value)
+        for key, value in scope.get("headers", [])
+        if key.lower() not in _IDENTITY_HEADERS
+    ]
+    query = parse_qsl(
+        scope.get("query_string", b"").decode("utf-8"),
+        keep_blank_values=True,
+    )
+    scope["query_string"] = urlencode(
+        [
+            (key, value)
+            for key, value in query
+            if key.lower() not in _IDENTITY_QUERY_KEYS
+        ]
+    ).encode("utf-8")
+
+
+class _IdentitySanitizerMiddleware:
+    """ASGI-level sanitizer so HTTP and any future websocket share policy."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        _sanitize_identity_scope(scope)
+        await self.app(scope, receive, send)
+
+
+async def _await_uncancellable(awaitable) -> None:
+    """Finish cleanup despite repeated cancellation, then propagate it."""
+    cleanup_task = asyncio.create_task(awaitable)
+    cancelled = False
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            cancelled = True
+    cleanup_task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 def create_root_app(
     settings: Settings,
     overrides: Mapping[str, Any] | None = None,
+    *,
+    custom_subagent_templates: list[Any] | None = None,
 ) -> FastAPI:
     """Create one isolated application runtime; no mutable runtime is global."""
     supplied = dict(overrides or {})
@@ -102,12 +167,18 @@ def create_root_app(
             user_id, agent_id, session_id
         )
 
+    runtime_agent_cls = supplied.get("custom_agent_cls") or build_runtime_agent_class(
+        lambda: runtime["model"]
+    )
+    templates = supplied.get("custom_subagent_templates", custom_subagent_templates)
     agentscope_app = supplied.get("agentscope_app") or create_agentscope_app(
         storage=storage,
         message_bus=bus,
         workspace_manager=workspace,
         enable_index_worker=False,
         extra_agent_tools=extra_tools,
+        custom_agent_cls=runtime_agent_cls,
+        custom_subagent_templates=templates,
         title="RunChain AgentScope Internal",
     )
 
@@ -124,16 +195,19 @@ def create_root_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         skill_db: AsyncSession | None = None
-        registry_closed = False
-        skill_db_closed = False
-
-        async def close_resource(name: str, closer) -> bool:
+        async def close_resource(name: str, closer) -> None:
             try:
                 await closer()
-                return True
-            except Exception:
+            except BaseException:
                 logger.warning("Failed to close %s", name, exc_info=True)
-                return False
+
+        async def cleanup() -> None:
+            # Registry completion is terminal before the database is disposed.
+            while not registry.closed:
+                await close_resource("mcp", registry.aclose)
+            if skill_db is not None:
+                await close_resource("skill database", skill_db.close)
+            await close_resource("database engine", engine.dispose)
 
         try:
             settings.workspace_root.mkdir(parents=True, exist_ok=True)
@@ -171,24 +245,15 @@ def create_root_app(
             app.state.skill_executor = executor
             app.state.mcp_service = mcp_service
             app.state.authorized_tool_service = authorized
-            app.state.model = build_model(settings)
+            model_runtime = build_model_runtime(settings)
+            app.state.model = model_runtime.model
+            app.state.model_configured = model_runtime.configured
+            runtime["model"] = model_runtime.model
 
             async with agentscope_app.router.lifespan_context(agentscope_app):
-                try:
-                    yield
-                finally:
-                    # Tool runtimes depend on database/workspace resources and
-                    # therefore terminate while those resources are still live.
-                    registry_closed = await close_resource("mcp", registry.aclose)
-                    skill_db_closed = await close_resource(
-                        "skill database", skill_db.close
-                    )
+                yield
         finally:
-            if not registry_closed:
-                await close_resource("mcp", registry.aclose)
-            if skill_db is not None and not skill_db_closed:
-                await close_resource("skill database", skill_db.close)
-            await close_resource("database engine", engine.dispose)
+            await _await_uncancellable(cleanup())
 
     app = FastAPI(title="RunChain Multi-tenant Agent", lifespan=lifespan)
     app.state.settings = settings
@@ -200,6 +265,8 @@ def create_root_app(
     app.state.mcp_registry = registry
     app.state.agentscope_app = agentscope_app
     app.state.runner_capabilities_verified = False
+    app.state.model_configured = False
+    app.add_middleware(_IdentitySanitizerMiddleware)
     install_error_handlers(app)
     app.include_router(auth_router)
     app.include_router(health_router)
@@ -215,12 +282,7 @@ def create_root_app(
     async def protect_agentscope(request: Request, call_next):
         if not request.url.path.startswith("/internal/agentscope"):
             return await call_next(request)
-        # Client-provided identity headers are always deleted before dispatch.
-        request.scope["headers"] = [
-            (key, value)
-            for key, value in request.scope.get("headers", [])
-            if key.lower() != b"x-user-id"
-        ]
+        _sanitize_identity_scope(request.scope)
         authorization = request.headers.get("authorization", "")
         if not authorization.startswith("Bearer "):
             return _error(401, "INVALID_TOKEN", "登录凭证无效")

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Type
+from dataclasses import dataclass
+from typing import Any, Callable, Type
 
 from pydantic import BaseModel
 
-from agentscope.agent import Agent
+from agentscope.agent import Agent, ModelConfig
 from agentscope.credential import CredentialBase, OpenAICredential
 from agentscope.message import Msg, TextBlock
 from agentscope.model import ChatModelBase, ChatResponse, OpenAIChatModel
@@ -15,6 +16,14 @@ from app.config import Settings
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ModelRuntime:
+    """A constructed model plus a non-secret readiness signal."""
+
+    model: ChatModelBase
+    configured: bool
 
 
 class _FakeCredential(CredentialBase):
@@ -52,12 +61,13 @@ class DeterministicFakeModel(ChatModelBase):
         )
 
 
-def build_model(settings: Settings) -> ChatModelBase:
-    """Build a network-free fake model unless the explicit real mode is set."""
+def build_model_runtime(settings: Settings) -> ModelRuntime:
+    """Construct a model and calculate readiness while the secret is in scope."""
     if settings.app_env == "test":
-        return DeterministicFakeModel()
+        return ModelRuntime(DeterministicFakeModel(), True)
 
     base_url = str(settings.model_base_url).rstrip("/")
+    api_key = settings.model_api_key.get_secret_value()
     logger.info(
         "Configuring model %s at %s://%s",
         settings.model_name,
@@ -66,16 +76,37 @@ def build_model(settings: Settings) -> ChatModelBase:
     )
     credential = OpenAICredential(
         name="runtime-model",
-        api_key=settings.model_api_key.get_secret_value(),
+        api_key=api_key,
         base_url=base_url,
     )
-    return OpenAIChatModel(
+    model = OpenAIChatModel(
         credential=credential,
         model=settings.model_name,
         stream=True,
         max_retries=2,
         client_kwargs={"timeout": 60.0},
     )
+    return ModelRuntime(model, bool(settings.model_name and api_key))
+
+
+def build_model(settings: Settings) -> ChatModelBase:
+    """Build a network-free fake model unless the explicit real mode is set."""
+    return build_model_runtime(settings).model
+
+
+def build_runtime_agent_class(
+    model_builder: Callable[[], ChatModelBase],
+) -> type[Agent]:
+    """Create an app-instance Agent class that ignores stored provider models."""
+
+    class RuntimeAgent(Agent):
+        def __init__(self, *args: Any, model: ChatModelBase, **kwargs: Any) -> None:
+            del model
+            kwargs["model_config"] = ModelConfig(fallback_model=None)
+            super().__init__(*args, model=model_builder(), **kwargs)
+
+    RuntimeAgent.__name__ = "RunChainRuntimeAgent"
+    return RuntimeAgent
 
 
 def build_agent(
