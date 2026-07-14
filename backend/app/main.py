@@ -24,6 +24,8 @@ from app.agents.factory import (
     build_model_runtime,
     build_runtime_agent_class,
 )
+from app.agents.hitl import HitlService
+from app.agents.reception import ReceptionTeamRuntime, reception_subagent_templates
 from app.agentscope_ext.sqlite_storage import SQLiteStorage
 from app.agentscope_ext.workspace_manager import ManagerLocalWorkspaceManager
 from app.api.auth import router as auth_router
@@ -171,6 +173,8 @@ def create_root_app(
         lambda: runtime["model"]
     )
     templates = supplied.get("custom_subagent_templates", custom_subagent_templates)
+    if templates is None:
+        templates = reception_subagent_templates()
     agentscope_app = supplied.get("agentscope_app") or create_agentscope_app(
         storage=storage,
         message_bus=bus,
@@ -266,6 +270,9 @@ def create_root_app(
     app.state.agentscope_app = agentscope_app
     app.state.runner_capabilities_verified = False
     app.state.model_configured = False
+    app.state.custom_subagent_templates = list(templates)
+    app.state.reception_runtime = ReceptionTeamRuntime(sessions, templates=list(templates))
+    app.state.hitl_service = HitlService(sessions)
     app.add_middleware(_IdentitySanitizerMiddleware)
     install_error_handlers(app)
     app.include_router(auth_router)

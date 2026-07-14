@@ -102,11 +102,47 @@ class TeamRunRow(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    request_id: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, index=True
+    )
     session_id: Mapped[str] = mapped_column(String(100), index=True)
     owner_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     status: Mapped[str] = mapped_column(String(32), default="pending")
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    result_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class TeamNodeRunRow(Base):
+    __tablename__ = "team_node_runs"
+    __table_args__ = (
+        UniqueConstraint("team_run_id", "agent_type"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    team_run_id: Mapped[str] = mapped_column(
+        ForeignKey("team_runs.id", ondelete="CASCADE"), index=True
+    )
+    owner_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    agent_type: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -122,6 +158,12 @@ class HitlRequestRow(Base):
     )
     prompt: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(32), default="pending")
+    decision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    modifications: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    result_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

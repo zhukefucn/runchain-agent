@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from sqlalchemy import event
@@ -39,7 +40,9 @@ async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 async def create_schema(target_engine: AsyncEngine | None = None) -> None:
     from app.db import models  # noqa: F401
+    from app.db.migrations import upgrade_database_url
 
     schema_engine = target_engine or engine
+    await asyncio.to_thread(upgrade_database_url, str(schema_engine.url))
     async with schema_engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)

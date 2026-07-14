@@ -20,6 +20,7 @@ from app.db.models import (
     SkillAuthorizationRow,
     SkillInvocationRow,
     SkillRow,
+    TeamNodeRunRow,
     TeamRunRow,
     User,
     WorkspaceFileRow,
@@ -40,6 +41,7 @@ EXPECTED_TABLES = {
     "skill_invocations",
     "skills",
     "team_runs",
+    "team_node_runs",
     "users",
     "workspace_files",
 }
@@ -47,6 +49,7 @@ OWNER_MODELS = (
     SessionRecordRow,
     MessageRow,
     TeamRunRow,
+    TeamNodeRunRow,
     HitlRequestRow,
     WorkspaceFileRow,
     SkillInvocationRow,
@@ -161,4 +164,4 @@ def test_create_schema_registers_models_without_caller_imports(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-    assert tables == EXPECTED_TABLES
+    assert tables == EXPECTED_TABLES | {"alembic_version"}
