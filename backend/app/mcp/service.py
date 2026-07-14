@@ -38,6 +38,10 @@ class McpValidationError(McpError):
     pass
 
 
+class McpNotFoundError(McpError, LookupError):
+    pass
+
+
 class McpConflictError(McpError):
     pass
 
@@ -374,6 +378,7 @@ class McpService:
         command: str,
         args: list[str],
         env: dict[str, str],
+        request_id: str | None = None,
     ) -> McpServerRow:
         self._require_admin(actor)
         executable, script = self._validate_registration(
@@ -398,7 +403,7 @@ class McpService:
                     resource_type="mcp_server",
                     resource_id=row.id,
                     result="success",
-                    request_id=None,
+                    request_id=request_id,
                     details={"operation": "create", "transport": "stdio"},
                 )
                 await db.commit()
@@ -412,7 +417,11 @@ class McpService:
         return row
 
     async def authorize(
-        self, actor: Principal, server_id: str, manager_user_id: str
+        self,
+        actor: Principal,
+        server_id: str,
+        manager_user_id: str,
+        request_id: str | None = None,
     ) -> McpAuthorizationRow:
         self._require_admin(actor)
         async with self._sessions() as db:
@@ -440,7 +449,7 @@ class McpService:
                 resource_type="mcp_server",
                 resource_id=server.id,
                 result="success",
-                request_id=None,
+                request_id=request_id,
                 details={"operation": "authorize", "role": "manager"},
             )
             await db.commit()
@@ -451,7 +460,7 @@ class McpService:
     async def _get(db: AsyncSession, server_id: str) -> McpServerRow:
         row = await db.get(McpServerRow, server_id)
         if row is None:
-            raise McpValidationError("MCP server not found")
+            raise McpNotFoundError("MCP server not found")
         return row
 
     def _verify_integrity(self, row: McpServerRow) -> tuple[Path, Path]:
@@ -501,7 +510,9 @@ class McpService:
             hashlib.sha256(material).hexdigest(),
         )
 
-    async def start(self, actor: Principal, server_id: str) -> None:
+    async def start(
+        self, actor: Principal, server_id: str, request_id: str | None = None
+    ) -> None:
         self._require_admin(actor)
         async with self._lock(server_id):
             async with self._sessions() as db:
@@ -520,6 +531,7 @@ class McpService:
                     action="mcp.start",
                     result="failure",
                     details={"operation": "connect", "status": "failure"},
+                    request_id=request_id,
                 )
                 raise
             key = self._runtime_key(row)
@@ -548,6 +560,7 @@ class McpService:
                     action="mcp.start",
                     result="failure",
                     details={"operation": "connect", "status": "failure"},
+                    request_id=request_id,
                 )
                 raise
             try:
@@ -564,6 +577,7 @@ class McpService:
                     action="mcp.start",
                     result="failure",
                     details={"operation": "connect", "status": "failure"},
+                    request_id=request_id,
                 )
                 raise
             await self._record_state_audit(
@@ -574,6 +588,7 @@ class McpService:
                 action="mcp.start",
                 result="success",
                 details={"operation": "connect", "transport": "stdio"},
+                request_id=request_id,
             )
 
     async def _record_state_audit(
@@ -586,6 +601,7 @@ class McpService:
         action: str,
         result: str,
         details: dict[str, Any],
+        request_id: str | None = None,
     ) -> None:
         async with self._sessions() as db:
             row = await self._get(db, server_id)
@@ -597,7 +613,7 @@ class McpService:
                 resource_type="mcp_server",
                 resource_id=server_id,
                 result=result,
-                request_id=None,
+                request_id=request_id,
                 details=details,
             )
             await db.commit()
@@ -623,7 +639,9 @@ class McpService:
                 details={"operation": "disconnect", "transport": "stdio"},
             )
 
-    async def health(self, actor: Principal, server_id: str) -> bool:
+    async def health(
+        self, actor: Principal, server_id: str, request_id: str | None = None
+    ) -> bool:
         self._require_admin(actor)
         async with self._sessions() as db:
             await self._get(db, server_id)
@@ -640,10 +658,13 @@ class McpService:
             "mcp.health",
             "connect",
             "success" if healthy else "failure",
+            request_id=request_id,
         )
         return healthy
 
-    async def list_tools(self, actor: Principal, server_id: str) -> list[dict[str, Any]]:
+    async def list_tools(
+        self, actor: Principal, server_id: str, request_id: str | None = None
+    ) -> list[dict[str, Any]]:
         self._require_admin(actor)
         async with self._sessions() as db:
             await self._get(db, server_id)
@@ -651,7 +672,13 @@ class McpService:
             runtime = await self._active_runtime(server_id)
         except McpUnavailableError:
             await self._audit_operation(
-                actor, server_id, "mcp.list_tools", "list", "failure", count=0
+                actor,
+                server_id,
+                "mcp.list_tools",
+                "list",
+                "failure",
+                count=0,
+                request_id=request_id,
             )
             raise
         tools = [
@@ -663,7 +690,13 @@ class McpService:
             for tool in sorted(runtime.tools.values(), key=lambda value: value.name)
         ]
         await self._audit_operation(
-            actor, server_id, "mcp.list_tools", "list", "success", count=len(tools)
+            actor,
+            server_id,
+            "mcp.list_tools",
+            "list",
+            "success",
+            count=len(tools),
+            request_id=request_id,
         )
         return tools
 
@@ -676,6 +709,7 @@ class McpService:
         result: str,
         *,
         count: int | None = None,
+        request_id: str | None = None,
     ) -> None:
         details: dict[str, Any] = {"operation": operation, "status": result}
         if count is not None:
@@ -687,7 +721,7 @@ class McpService:
                 resource_type="mcp_server",
                 resource_id=server_id,
                 result=result,
-                request_id=None,
+                request_id=request_id,
                 details=details,
             )
             await db.commit()

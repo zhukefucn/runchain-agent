@@ -335,14 +335,16 @@ class SkillService:
         skill_id: str,
         operation: str,
         status: str,
+        request_id: str | None = None,
+        result: str = "success",
     ) -> None:
         AuditRepository(self._db).add_pending(
             actor_user_id=actor.user_id,
             action=action,
             resource_type="skill",
             resource_id=skill_id,
-            result="success",
-            request_id=None,
+            result=result,
+            request_id=request_id,
             details={"operation": operation, "status": status},
         )
 
@@ -365,11 +367,15 @@ class SkillService:
         )
         return expected, marker
 
-    async def install(self, actor: Principal, upload) -> SkillRow:
+    async def install(
+        self, actor: Principal, upload, request_id: str | None = None
+    ) -> SkillRow:
         async with _policy_lock_for_running_loop():
-            return await self._install_locked(actor, upload)
+            return await self._install_locked(actor, upload, request_id)
 
-    async def _install_locked(self, actor: Principal, upload) -> SkillRow:
+    async def _install_locked(
+        self, actor: Principal, upload, request_id: str | None
+    ) -> SkillRow:
         self._require_admin(actor)
         package = validate_skill_zip(upload)
         manifest = package.manifest
@@ -393,6 +399,15 @@ class SkillService:
                         raise SkillCleanupError(
                             "Skill finalize failed; package remains quarantined"
                         ) from exc
+                self._audit_pending(
+                    actor,
+                    "skill.install",
+                    existing.id,
+                    "install",
+                    "idempotent",
+                    request_id,
+                )
+                await self._db.commit()
                 return existing
 
             self._install_root.mkdir(parents=True, exist_ok=True)
@@ -432,7 +447,9 @@ class SkillService:
                     install_path=str(destination),
                 )
                 await self._repository.add(row)
-                self._audit_pending(actor, "skill.install", row.id, "install", "success")
+                self._audit_pending(
+                    actor, "skill.install", row.id, "install", "success", request_id
+                )
                 await self._db.flush()
                 if destination.exists():
                     raise SkillConflictError("Skill destination already exists")
@@ -471,11 +488,15 @@ class SkillService:
                 ) from cleanup_error
             raise original
 
-    async def publish(self, actor: Principal, skill_id: str) -> SkillRow:
+    async def publish(
+        self, actor: Principal, skill_id: str, request_id: str | None = None
+    ) -> SkillRow:
         async with _policy_lock_for_running_loop():
-            return await self._publish_locked(actor, skill_id)
+            return await self._publish_locked(actor, skill_id, request_id)
 
-    async def _publish_locked(self, actor: Principal, skill_id: str) -> SkillRow:
+    async def _publish_locked(
+        self, actor: Principal, skill_id: str, request_id: str | None
+    ) -> SkillRow:
         self._require_admin(actor)
         row = await self._repository.get(skill_id)
         if row is None:
@@ -487,7 +508,9 @@ class SkillService:
             try:
                 await self._repository.retire_published_versions(row.name, row.id)
                 row.status = "published"
-                self._audit_pending(actor, "skill.publish", row.id, "update", "enabled")
+                self._audit_pending(
+                    actor, "skill.publish", row.id, "update", "enabled", request_id
+                )
                 await self._db.commit()
             except IntegrityError as exc:
                 await self._db.rollback()
@@ -497,11 +520,15 @@ class SkillService:
                 raise
         return row
 
-    async def disable(self, actor: Principal, skill_id: str) -> SkillRow:
+    async def disable(
+        self, actor: Principal, skill_id: str, request_id: str | None = None
+    ) -> SkillRow:
         async with _policy_lock_for_running_loop():
-            return await self._disable_locked(actor, skill_id)
+            return await self._disable_locked(actor, skill_id, request_id)
 
-    async def _disable_locked(self, actor: Principal, skill_id: str) -> SkillRow:
+    async def _disable_locked(
+        self, actor: Principal, skill_id: str, request_id: str | None
+    ) -> SkillRow:
         self._require_admin(actor)
         row = await self._repository.get(skill_id)
         if row is None:
@@ -509,7 +536,9 @@ class SkillService:
         try:
             row.status = "disabled"
             await self._repository.revoke_all(row.id)
-            self._audit_pending(actor, "skill.disable", row.id, "update", "disabled")
+            self._audit_pending(
+                actor, "skill.disable", row.id, "update", "disabled", request_id
+            )
             await self._db.commit()
         except BaseException:
             await self._db.rollback()
@@ -517,13 +546,23 @@ class SkillService:
         return row
 
     async def authorize(
-        self, actor: Principal, skill_id: str, manager_user_id: str
+        self,
+        actor: Principal,
+        skill_id: str,
+        manager_user_id: str,
+        request_id: str | None = None,
     ):
         async with _policy_lock_for_running_loop():
-            return await self._authorize_locked(actor, skill_id, manager_user_id)
+            return await self._authorize_locked(
+                actor, skill_id, manager_user_id, request_id
+            )
 
     async def _authorize_locked(
-        self, actor: Principal, skill_id: str, manager_user_id: str
+        self,
+        actor: Principal,
+        skill_id: str,
+        manager_user_id: str,
+        request_id: str | None,
     ):
         self._require_admin(actor)
         if await self._repository.get(skill_id) is None:
@@ -534,7 +573,14 @@ class SkillService:
             authorization = await self._repository.authorize(
                 skill_id, manager_user_id, actor.user_id
             )
-            self._audit_pending(actor, "skill.authorize", skill_id, "authorize", "allowed")
+            self._audit_pending(
+                actor,
+                "skill.authorize",
+                skill_id,
+                "authorize",
+                "allowed",
+                request_id,
+            )
             await self._db.commit()
         except BaseException:
             await self._db.rollback()
@@ -542,19 +588,29 @@ class SkillService:
         return authorization
 
     async def revoke(
-        self, actor: Principal, skill_id: str, manager_user_id: str
+        self,
+        actor: Principal,
+        skill_id: str,
+        manager_user_id: str,
+        request_id: str | None = None,
     ) -> bool:
         async with _policy_lock_for_running_loop():
-            return await self._revoke_locked(actor, skill_id, manager_user_id)
+            return await self._revoke_locked(actor, skill_id, manager_user_id, request_id)
 
     async def _revoke_locked(
-        self, actor: Principal, skill_id: str, manager_user_id: str
+        self,
+        actor: Principal,
+        skill_id: str,
+        manager_user_id: str,
+        request_id: str | None,
     ) -> bool:
         self._require_admin(actor)
         try:
             revoked = await self._repository.revoke(skill_id, manager_user_id)
             if revoked:
-                self._audit_pending(actor, "skill.revoke", skill_id, "revoke", "success")
+                self._audit_pending(
+                    actor, "skill.revoke", skill_id, "revoke", "success", request_id
+                )
             await self._db.commit()
         except BaseException:
             await self._db.rollback()

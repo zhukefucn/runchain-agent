@@ -16,6 +16,7 @@ _ALLOWED_ENUM_FIELDS: dict[str, frozenset[str]] = {
             "authorize",
             "connect",
             "create",
+            "decide",
             "delete",
             "disconnect",
             "execute",

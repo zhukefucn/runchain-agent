@@ -281,6 +281,39 @@ class ReceptionTeamRuntime:
                 )
             await db.commit()
 
+    async def _persist_runtime_failed(self, owner: str, run_id: str) -> None:
+        """Terminalize only a still-running orchestration after an unexpected error."""
+        now = datetime.now(timezone.utc)
+        async with self._sessions() as db:
+            changed = await db.execute(
+                update(TeamRunRow)
+                .where(
+                    TeamRunRow.id == run_id,
+                    TeamRunRow.owner_user_id == owner,
+                    TeamRunRow.status == "running",
+                )
+                .values(
+                    status="error",
+                    completed_at=now,
+                    result_data={"error_code": "RUNTIME_FAILED"},
+                )
+            )
+            if changed.rowcount == 1:
+                await db.execute(
+                    update(TeamNodeRunRow)
+                    .where(
+                        TeamNodeRunRow.team_run_id == run_id,
+                        TeamNodeRunRow.owner_user_id == owner,
+                        TeamNodeRunRow.status.in_(("running", "pending")),
+                    )
+                    .values(
+                        status="error",
+                        completed_at=now,
+                        error_code="RUNTIME_FAILED",
+                    )
+                )
+            await db.commit()
+
     async def chat(self, owner_user_id: str, session_id: str, prompt: str, *, request_id: str | None = None) -> AsyncIterator[StableEvent]:
         request_id = request_id or str(uuid4())
         run_id = await self._start_run(owner_user_id, session_id, request_id)
@@ -342,6 +375,11 @@ class ReceptionTeamRuntime:
                 )
             except asyncio.CancelledError:
                 pass
+            raise
+        except Exception:
+            await _await_uncancellable(
+                self._persist_runtime_failed(owner_user_id, run_id)
+            )
             raise
 
 

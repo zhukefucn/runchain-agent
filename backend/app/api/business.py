@@ -13,10 +13,12 @@ from app.db.models import McpServerRow, Role, SkillInvocationRow, SkillRow
 from app.errors import ApiError
 from app.mcp.service import (
     McpConflictError,
+    McpNotFoundError,
     McpPermissionError,
     McpUnavailableError,
     McpValidationError,
 )
+from app.repositories.audit import AuditRepository
 from app.skills.package import MAX_UPLOAD_BYTES, SkillPackageError
 from app.skills.service import (
     SkillCleanupError,
@@ -82,6 +84,31 @@ def _skill_error(error: Exception) -> ApiError:
     return ApiError(500, "INTERNAL_ERROR", "服务器内部错误")
 
 
+async def _audit_failure(
+    request: Request,
+    actor: Principal,
+    action: str,
+    resource_type: str,
+    resource_id: str | None,
+    operation: str,
+    status_code: int,
+) -> None:
+    async with request.app.state.session_factory() as db:
+        await AuditRepository(db).record(
+            actor_user_id=actor.user_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            result="failure",
+            request_id=request.state.request_id,
+            details={
+                "operation": operation,
+                "status": "failure",
+                "status_code": status_code,
+            },
+        )
+
+
 @router.get("/skills")
 async def list_skills(
     _principal: BusinessPrincipal,
@@ -106,25 +133,40 @@ async def upload_skill(request: Request, principal: BusinessPrincipal):
         "application/zip",
         "application/octet-stream",
     }:
+        await _audit_failure(
+            request, principal, "skill.install", "skill", None, "install", 415
+        )
         raise ApiError(415, "UNSUPPORTED_MEDIA_TYPE", "仅接受本地 ZIP 文件")
     try:
         declared_length = int(request.headers.get("content-length", "0"))
     except ValueError:
         declared_length = 0
     if declared_length > MAX_UPLOAD_BYTES:
+        await _audit_failure(
+            request, principal, "skill.install", "skill", None, "install", 413
+        )
         raise ApiError(413, "UPLOAD_TOO_LARGE", "Skill ZIP 超过大小限制")
     chunks: list[bytes] = []
     total = 0
     async for chunk in request.stream():
         total += len(chunk)
         if total > MAX_UPLOAD_BYTES:
+            await _audit_failure(
+                request, principal, "skill.install", "skill", None, "install", 413
+            )
             raise ApiError(413, "UPLOAD_TOO_LARGE", "Skill ZIP 超过大小限制")
         chunks.append(chunk)
     upload = b"".join(chunks)
     try:
-        row = await request.app.state.skill_service.install(principal, upload)
+        row = await request.app.state.skill_service.install(
+            principal, upload, request_id=request.state.request_id
+        )
     except Exception as error:
-        raise _skill_error(error) from error
+        api_error = _skill_error(error)
+        await _audit_failure(
+            request, principal, "skill.install", "skill", None, "install", api_error.status_code
+        )
+        raise api_error from error
     return _skill(row)
 
 
@@ -133,9 +175,15 @@ async def publish_skill(
     skill_id: str, request: Request, principal: BusinessPrincipal
 ):
     try:
-        row = await request.app.state.skill_service.publish(principal, skill_id)
+        row = await request.app.state.skill_service.publish(
+            principal, skill_id, request_id=request.state.request_id
+        )
     except Exception as error:
-        raise _skill_error(error) from error
+        api_error = _skill_error(error)
+        await _audit_failure(
+            request, principal, "skill.publish", "skill", skill_id, "update", api_error.status_code
+        )
+        raise api_error from error
     return _skill(row)
 
 
@@ -144,9 +192,15 @@ async def disable_skill(
     skill_id: str, request: Request, principal: BusinessPrincipal
 ):
     try:
-        row = await request.app.state.skill_service.disable(principal, skill_id)
+        row = await request.app.state.skill_service.disable(
+            principal, skill_id, request_id=request.state.request_id
+        )
     except Exception as error:
-        raise _skill_error(error) from error
+        api_error = _skill_error(error)
+        await _audit_failure(
+            request, principal, "skill.disable", "skill", skill_id, "update", api_error.status_code
+        )
+        raise api_error from error
     return _skill(row)
 
 
@@ -159,10 +213,17 @@ async def authorize_skill(
 ):
     try:
         row = await request.app.state.skill_service.authorize(
-            principal, skill_id, payload.manager_user_id
+            principal,
+            skill_id,
+            payload.manager_user_id,
+            request_id=request.state.request_id,
         )
     except Exception as error:
-        raise _skill_error(error) from error
+        api_error = _skill_error(error)
+        await _audit_failure(
+            request, principal, "skill.authorize", "skill", skill_id, "authorize", api_error.status_code
+        )
+        raise api_error from error
     return {"id": row.id, "skill_id": row.skill_id, "user_id": row.user_id}
 
 
@@ -215,6 +276,8 @@ async def list_mcp_servers(
 
 
 def _mcp_error(error: Exception) -> ApiError:
+    if isinstance(error, McpNotFoundError):
+        return ApiError(404, "NOT_FOUND", "资源不存在")
     if isinstance(error, McpPermissionError):
         return ApiError(403, "ROLE_FORBIDDEN", "当前角色无权访问")
     if isinstance(error, McpValidationError):
@@ -239,9 +302,14 @@ async def create_mcp_server(
             command=payload.command,
             args=payload.args,
             env=payload.env,
+            request_id=request.state.request_id,
         )
     except Exception as error:
-        raise _mcp_error(error) from error
+        api_error = _mcp_error(error)
+        await _audit_failure(
+            request, principal, "mcp.register", "mcp_server", None, "create", api_error.status_code
+        )
+        raise api_error from error
     return _mcp(row)
 
 
@@ -253,11 +321,24 @@ async def test_mcp_server(
 ):
     service = request.app.state.mcp_service
     try:
-        await service.start(principal, server_id)
-        healthy = await service.health(principal, server_id)
-        tools = await service.list_tools(principal, server_id) if healthy else []
+        await service.start(principal, server_id, request_id=request.state.request_id)
+        healthy = await service.health(
+            principal, server_id, request_id=request.state.request_id
+        )
+        tools = (
+            await service.list_tools(
+                principal, server_id, request_id=request.state.request_id
+            )
+            if healthy
+            else []
+        )
     except Exception as error:
-        raise _mcp_error(error) from error
+        api_error = _mcp_error(error)
+        if isinstance(error, McpNotFoundError):
+            await _audit_failure(
+                request, principal, "mcp.test", "mcp_server", server_id, "connect", api_error.status_code
+            )
+        raise api_error from error
     return {"server_id": server_id, "healthy": healthy, "tools": tools}
 
 

@@ -2,23 +2,22 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from argon2 import PasswordHasher
 from fastapi import APIRouter, Depends, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from urllib.parse import urlsplit, urlunsplit
 
 from app.auth.deps import get_session, require_role
 from app.auth.models import Principal
 from app.db.models import AuditRecordRow, Role, User
 from app.errors import ApiError
-from app.repositories.audit import AuditRepository
+from app.repositories.audit import AuditRepository, sanitize_audit_details
 
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 SystemPrincipal = Annotated[Principal, Depends(require_role(Role.SYSTEM_ADMIN))]
-_password_hasher = PasswordHasher()
 
 
 class UserCreate(BaseModel):
@@ -54,6 +53,44 @@ def _user(row: User) -> dict[str, Any]:
     }
 
 
+async def _audit_user_failure(
+    request: Request,
+    principal: Principal,
+    action: str,
+    resource_id: str | None,
+    operation: str,
+    status_code: int,
+) -> None:
+    async with request.app.state.session_factory() as audit_db:
+        await AuditRepository(audit_db).record(
+            actor_user_id=principal.user_id,
+            action=action,
+            resource_type="user",
+            resource_id=resource_id,
+            result="failure",
+            request_id=request.state.request_id,
+            details={
+                "operation": operation,
+                "status": "failure",
+                "status_code": status_code,
+            },
+        )
+
+
+def _safe_model_url(value: Any) -> str:
+    parsed = urlsplit(str(value))
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port is not None else host
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme, netloc, path, "", ""))
+
+
 @router.get("/users")
 async def list_users(
     _principal: SystemPrincipal,
@@ -78,7 +115,7 @@ async def create_user(
 ):
     row = User(
         username=payload.username,
-        password_hash=_password_hasher.hash(payload.password),
+        password_hash=request.app.state.password_hasher.hash(payload.password),
         role=payload.role,
         is_active=payload.is_active,
     )
@@ -98,6 +135,14 @@ async def create_user(
         await db.refresh(row)
     except IntegrityError as error:
         await db.rollback()
+        await _audit_user_failure(
+            request,
+            principal,
+            "system.user.create",
+            row.id,
+            "create",
+            409,
+        )
         raise ApiError(409, "USER_CONFLICT", "用户名已存在") from error
     return _user(row)
 
@@ -112,13 +157,21 @@ async def patch_user(
 ):
     row = await db.get(User, user_id)
     if row is None:
+        await _audit_user_failure(
+            request,
+            principal,
+            "system.user.patch",
+            user_id,
+            "update",
+            404,
+        )
         raise ApiError(404, "NOT_FOUND", "资源不存在")
     if payload.role is not None:
         row.role = payload.role
     if payload.is_active is not None:
         row.is_active = payload.is_active
     if payload.password is not None:
-        row.password_hash = _password_hasher.hash(payload.password)
+        row.password_hash = request.app.state.password_hasher.hash(payload.password)
     AuditRepository(db).add_pending(
         actor_user_id=principal.user_id,
         action="system.user.patch",
@@ -143,8 +196,12 @@ async def model_status(request: Request, _principal: SystemPrincipal):
     return {
         "configured": bool(request.app.state.model_configured),
         "model": settings.model_name,
-        "base_url": str(settings.model_base_url),
-        "connectivity": "mock" if settings.app_env == "test" else "not_tested",
+        "base_url": _safe_model_url(settings.model_base_url),
+        "connectivity": (
+            "not_checked"
+            if bool(request.app.state.model_configured)
+            else "not_configured"
+        ),
     }
 
 
@@ -173,7 +230,7 @@ async def audit_logs(
                 "resource_id": row.resource_id,
                 "result": row.result,
                 "request_id": row.request_id,
-                "details": row.details,
+                "details": sanitize_audit_details(row.details),
                 "created_at": row.created_at,
             }
             for row in rows

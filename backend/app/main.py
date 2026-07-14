@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, urlencode
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
+from argon2 import PasswordHasher
 from fastapi.responses import JSONResponse
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -273,6 +274,7 @@ def create_root_app(
     app.state.agentscope_app = agentscope_app
     app.state.runner_capabilities_verified = False
     app.state.model_configured = False
+    app.state.password_hasher = supplied.get("password_hasher") or PasswordHasher()
     app.state.custom_subagent_templates = list(templates)
     app.state.reception_runtime = ReceptionTeamRuntime(
         sessions,

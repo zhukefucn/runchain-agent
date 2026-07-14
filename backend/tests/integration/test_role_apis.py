@@ -11,9 +11,12 @@ from types import SimpleNamespace
 from httpx import ASGITransport, AsyncClient
 import pytest
 from sqlalchemy import select
+from starlette.requests import Request
 
+from app.agents.sse import StableEvent
+from app.auth.models import Principal
 from app.config import Settings
-from app.db.models import AuditRecordRow, MessageRow, Role, User
+from app.db.models import AuditRecordRow, MessageRow, Role, SessionRecordRow, User
 from app.main import create_root_app
 from app.skills.package import MAX_UPLOAD_BYTES
 
@@ -134,6 +137,10 @@ def test_both_managers_are_isolated_and_client_cannot_supply_owner(tmp_path):
             )
             assert hidden.status_code == 404
             assert set(hidden.json()) == {"code", "message", "request_id"}
+            hidden_files = await client.get(
+                f"/api/manager/files?session_id={session_id}", headers=two
+            )
+            assert hidden_files.status_code == 404
 
             second = await client.post(
                 "/api/manager/sessions",
@@ -141,6 +148,120 @@ def test_both_managers_are_isolated_and_client_cannot_supply_owner(tmp_path):
                 json={"title": "manager two", "agent_id": "reception-leader"},
             )
             assert second.status_code == 201
+
+    asyncio.run(scenario())
+
+
+def test_manager_stream_sanitizes_runtime_errors_and_closes_nested_generator(tmp_path):
+    class BrokenRuntime:
+        def __init__(self):
+            self.closed = asyncio.Event()
+
+        async def chat(self, _owner, session_id, _prompt, *, request_id):
+            try:
+                yield StableEvent(
+                    type="run_started",
+                    request_id=request_id,
+                    session_id=session_id,
+                    run_id="run-broken",
+                )
+                raise RuntimeError("secret provider traceback")
+            finally:
+                self.closed.set()
+
+    async def scenario():
+        async with _client(tmp_path) as (client, app):
+            runtime = BrokenRuntime()
+            app.state.reception_runtime = runtime
+            headers = await _auth(client, "manager0001")
+            created = await client.post(
+                "/api/manager/sessions",
+                headers=headers,
+                json={"title": "broken", "agent_id": "reception-leader"},
+            )
+            response = await client.post(
+                f"/api/manager/sessions/{created.json()['id']}/chat",
+                headers=headers,
+                json={"prompt": "fail safely"},
+            )
+            assert response.status_code == 200
+            assert "event: error\n" in response.text
+            assert "secret provider traceback" not in response.text
+            assert runtime.closed.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_manager_stream_close_is_repeat_cancel_safe(tmp_path):
+    class BlockingRuntime:
+        def __init__(self):
+            self.finalizing = asyncio.Event()
+            self.release = asyncio.Event()
+            self.closed = asyncio.Event()
+
+        async def chat(self, _owner, session_id, _prompt, *, request_id):
+            try:
+                yield StableEvent(
+                    type="run_started",
+                    request_id=request_id,
+                    session_id=session_id,
+                    run_id="run-cancel",
+                )
+                await asyncio.Event().wait()
+            finally:
+                self.finalizing.set()
+                await self.release.wait()
+                self.closed.set()
+
+    async def scenario():
+        from app.api.manager import ChatRequest, chat
+
+        async with _client(tmp_path) as (_client_instance, app):
+            runtime = BlockingRuntime()
+            app.state.reception_runtime = runtime
+            async with app.state.session_factory() as db:
+                manager = await db.scalar(
+                    select(User).where(User.username == "manager0001")
+                )
+                session = SessionRecordRow(
+                    owner_user_id=manager.id,
+                    agent_id="reception-leader",
+                    title="cancel",
+                )
+                db.add(session)
+                await db.commit()
+                await db.refresh(session)
+                request = Request(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/api/manager/chat",
+                        "headers": [],
+                        "query_string": b"",
+                        "app": app,
+                        "state": {"request_id": "repeat-cancel"},
+                    }
+                )
+                response = await chat(
+                    session.id,
+                    ChatRequest(prompt="cancel"),
+                    request,
+                    Principal(manager.id, Role.MANAGER, "bank_demo"),
+                    db,
+                )
+                iterator = response.body_iterator
+                first = await iterator.__anext__()
+                assert "run_started" in first
+                closing = asyncio.create_task(iterator.aclose())
+                await runtime.finalizing.wait()
+                closing.cancel()
+                await asyncio.sleep(0)
+                closing.cancel()
+                assert not closing.done()
+                runtime.release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await closing
+                assert runtime.closed.is_set()
 
     asyncio.run(scenario())
 
@@ -259,7 +380,7 @@ def test_business_skill_lifecycle_authorization_metadata_and_audit(tmp_path):
 
 def test_business_skill_upload_rejects_oversized_body_before_materializing_it(tmp_path):
     async def scenario():
-        async with _client(tmp_path) as (client, _app):
+        async with _client(tmp_path) as (client, app):
             admin = await _auth(client, "business_admin01")
             response = await client.post(
                 "/api/business/skills/upload",
@@ -272,6 +393,73 @@ def test_business_skill_upload_rejects_oversized_body_before_materializing_it(tm
             )
             assert response.status_code == 413
             assert response.json()["code"] == "UPLOAD_TOO_LARGE"
+            async with app.state.session_factory() as db:
+                audit = await db.scalar(
+                    select(AuditRecordRow).where(
+                        AuditRecordRow.request_id == response.headers["X-Request-ID"]
+                    )
+                )
+            assert audit is not None and audit.result == "failure"
+
+    asyncio.run(scenario())
+
+
+def test_failed_and_idempotent_skill_mutation_attempts_keep_http_request_ids(tmp_path):
+    async def scenario():
+        async with _client(tmp_path) as (client, app):
+            admin = await _auth(client, "business_admin01")
+            invalid = await client.post(
+                "/api/business/skills/upload",
+                headers={**admin, "Content-Type": "application/zip"},
+                content=b"invalid",
+            )
+            assert invalid.status_code == 409
+            package = _skill_zip()
+            first = await client.post(
+                "/api/business/skills/upload",
+                headers={**admin, "Content-Type": "application/zip"},
+                content=package,
+            )
+            second = await client.post(
+                "/api/business/skills/upload",
+                headers={**admin, "Content-Type": "application/zip"},
+                content=package,
+            )
+            assert first.status_code == second.status_code == 201
+            expected_ids = {
+                invalid.headers["X-Request-ID"],
+                first.headers["X-Request-ID"],
+                second.headers["X-Request-ID"],
+            }
+            async with app.state.session_factory() as db:
+                rows = list(
+                    await db.scalars(
+                        select(AuditRecordRow).where(
+                            AuditRecordRow.action == "skill.install"
+                        )
+                    )
+                )
+            assert {row.request_id for row in rows} == expected_ids
+            assert {row.result for row in rows} == {"success", "failure"}
+
+    asyncio.run(scenario())
+
+
+def test_missing_mcp_test_is_404_and_failure_is_audited(tmp_path):
+    async def scenario():
+        async with _client(tmp_path) as (client, app):
+            admin = await _auth(client, "business_admin01")
+            response = await client.post(
+                "/api/business/mcp-servers/missing/test", headers=admin
+            )
+            assert response.status_code == 404
+            async with app.state.session_factory() as db:
+                row = await db.scalar(
+                    select(AuditRecordRow).where(
+                        AuditRecordRow.request_id == response.headers["X-Request-ID"]
+                    )
+                )
+            assert row is not None and row.result == "failure"
 
     asyncio.run(scenario())
 
@@ -292,14 +480,14 @@ def test_business_mcp_endpoints_are_local_metadata_and_delegate_test(tmp_path):
                 created_at=None,
             )
 
-        async def start(self, actor, server_id):
+        async def start(self, actor, server_id, request_id=None):
             self.calls.append(("start", actor, server_id))
 
-        async def health(self, actor, server_id):
+        async def health(self, actor, server_id, request_id=None):
             self.calls.append(("health", actor, server_id))
             return True
 
-        async def list_tools(self, actor, server_id):
+        async def list_tools(self, actor, server_id, request_id=None):
             self.calls.append(("tools", actor, server_id))
             return [{"name": "pickup", "description": "mock", "input_schema": {}}]
 
@@ -395,5 +583,58 @@ def test_system_user_model_and_audit_apis_never_return_secrets(tmp_path):
             async with app.state.session_factory() as db:
                 row = await db.get(User, user_id)
                 assert row.password_hash != "another-password"
+
+    asyncio.run(scenario())
+
+
+def test_system_model_status_sanitizes_url_and_failed_users_are_audited(tmp_path):
+    async def scenario():
+        settings = _settings(tmp_path).model_copy(
+            update={
+                "model_base_url": "https://safe.example/v1?api_key=query-secret#fragment"
+            }
+        )
+        app = create_root_app(settings)
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as client:
+                headers = await _auth(client, "system_admin01")
+                model = await client.get("/api/system/model/status", headers=headers)
+                assert "query-secret" not in json.dumps(model.json())
+                assert model.json()["base_url"] == "https://safe.example/v1"
+                assert model.json()["connectivity"] in {
+                    "not_checked",
+                    "not_configured",
+                }
+                duplicate = await client.post(
+                    "/api/system/users",
+                    headers=headers,
+                    json={
+                        "username": "manager0001",
+                        "password": "duplicate-password",
+                        "role": "manager",
+                    },
+                )
+                missing = await client.patch(
+                    "/api/system/users/missing",
+                    headers=headers,
+                    json={"is_active": False},
+                )
+                assert duplicate.status_code == 409
+                assert missing.status_code == 404
+                async with app.state.session_factory() as db:
+                    request_ids = set(
+                        await db.scalars(
+                            select(AuditRecordRow.request_id).where(
+                                AuditRecordRow.result == "failure"
+                            )
+                        )
+                    )
+                assert {
+                    duplicate.headers["X-Request-ID"],
+                    missing.headers["X-Request-ID"],
+                } <= request_ids
 
     asyncio.run(scenario())
