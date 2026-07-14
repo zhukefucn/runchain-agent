@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     skill_root: Path = Path("skills")
     runner_root: Path = Path("runner")
     mcp_root: Path = Path("backend/app/mcp")
+    frontend_dist: Path = Path("frontend/dist")
     jwt_secret_key: SecretStr
     model_name: str = "step-3.7-flash"
     model_base_url: AnyHttpUrl = "https://api.stepfun.com/step_plan/v1"

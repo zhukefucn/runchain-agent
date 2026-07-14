@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import hashlib
 from typing import Any
 
 from sqlalchemy import delete, select, text
@@ -17,6 +18,7 @@ from agentscope.app.storage._model import (
     KnowledgeDocumentRecord,
     KnowledgeDocumentStatus,
     ScheduleRecord,
+    ChatModelConfig,
     SessionConfig,
     SessionRecord,
     SessionSource,
@@ -29,6 +31,9 @@ from agentscope.state import AgentState
 
 from app.db.models import AgentScopeStorageRow, MessageRow, SessionRecordRow
 from app.db.session import async_session_factory
+
+
+RUNTIME_PLACEHOLDER_CREDENTIAL_ID = "runchain-runtime-placeholder"
 
 
 class SQLiteStorage(StorageBase):
@@ -49,6 +54,14 @@ class SQLiteStorage(StorageBase):
         return f"{len(knowledge_base_id)}:{knowledge_base_id}{document_id}"
 
     @staticmethod
+    def workspace_id_for(owner_user_id: str, agent_id: str) -> str:
+        """Match AgentScope PER_AGENT workspace IDs with a path-safe digest."""
+        return hashlib.blake2b(
+            f"{owner_user_id}::{agent_id}".encode("utf-8"),
+            digest_size=8,
+        ).hexdigest()
+
+    @staticmethod
     def _session_from_row(row: SessionRecordRow) -> SessionRecord:
         if row.storage_payload:
             record = SessionRecord.model_validate(row.storage_payload)
@@ -62,10 +75,17 @@ class SQLiteStorage(StorageBase):
                 source_schedule_id=row.source_schedule_id,
                 team_id=row.team_id,
                 config=SessionConfig(
-                    workspace_id=(
-                        f"{row.owner_user_id}/sessions/{row.id}"
+                    workspace_id=SQLiteStorage.workspace_id_for(
+                        row.owner_user_id,
+                        row.agent_id,
                     ),
                     name=row.title,
+                    chat_model_config=ChatModelConfig(
+                        type="openai_credential",
+                        credential_id=RUNTIME_PLACEHOLDER_CREDENTIAL_ID,
+                        model="runtime-placeholder-never-called",
+                        parameters={},
+                    ),
                 ),
                 created_at=row.created_at,
                 updated_at=row.created_at,

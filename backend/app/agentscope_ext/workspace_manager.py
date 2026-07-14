@@ -224,12 +224,21 @@ class ManagerLocalWorkspaceManager(WorkspaceManagerBase):
                 bound_session = _validate_segment(
                     binding.session_id, field="resolved session_id"
                 )
+                raw_bound_workspace = getattr(binding, "workspace_id", None)
+                bound_workspace = (
+                    _validate_segment(
+                        raw_bound_workspace,
+                        field="resolved workspace_id",
+                    )
+                    if raw_bound_workspace is not None
+                    else None
+                )
             except (AttributeError, ValueError) as exc:
                 raise PermissionError(
                     "session resolver returned an unsafe binding"
                 ) from exc
         else:
-            bound_owner = bound_agent = bound_session = None
+            bound_owner = bound_agent = bound_session = bound_workspace = None
         if (
             binding is None
             or bound_owner != safe_user_id
@@ -238,7 +247,7 @@ class ManagerLocalWorkspaceManager(WorkspaceManagerBase):
         ):
             raise PermissionError("session does not belong to this manager and agent")
 
-        expected_workspace_id = self.assign_workspace_id(
+        expected_workspace_id = bound_workspace or self.assign_workspace_id(
             user_id=safe_user_id,
             agent_id=safe_agent_id,
             session_id=safe_session_id,

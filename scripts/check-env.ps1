@@ -66,7 +66,8 @@ catch {
 }
 
 $listeningPorts = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners().Port
-foreach ($port in @(8000, 5173)) {
+# FastAPI serves both the API and the built Vue application in Phase 1.
+foreach ($port in @(8000)) {
     if ($listeningPorts -contains $port) {
         Add-Failure "Port $port is already in use."
     }

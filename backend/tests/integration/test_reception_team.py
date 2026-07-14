@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from functools import wraps
 from pathlib import Path
+import re
 
 import pytest
 from sqlalchemy import select
@@ -131,6 +132,21 @@ async def test_reception_team_uses_real_templates_and_three_mock_tool_paths(tmp_
     team = await storage.get_team(manager.id, leader_session.team_id)
     assert team is not None
     assert len(team.data.members) == 3
+    worker_sessions = [
+        await storage.get_session(manager.id, member.agent_id, member.session_id)
+        for member in team.data.members
+    ]
+    assert re.fullmatch(r"[0-9a-f]{16}", leader_session.config.workspace_id)
+    assert leader_session.config.chat_model_config is not None
+    assert (
+        leader_session.config.chat_model_config.credential_id
+        == "runchain-runtime-placeholder"
+    )
+    assert all(
+        worker is not None
+        and worker.config.workspace_id == leader_session.config.workspace_id
+        for worker in worker_sessions
+    )
     worker_agents = [
         await storage.get_agent(manager.id, member.agent_id)
         for member in team.data.members

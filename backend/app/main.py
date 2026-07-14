@@ -13,13 +13,14 @@ from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from argon2 import PasswordHasher
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentscope.app import create_app as create_agentscope_app
 from agentscope.app import deps as agentscope_deps
 from agentscope.app.message_bus import InMemoryMessageBus
+from agentscope.credential import OpenAICredential
 
 from app.agents.factory import (
     build_model_runtime,
@@ -27,7 +28,10 @@ from app.agents.factory import (
 )
 from app.agents.hitl import HitlService
 from app.agents.reception import ReceptionTeamRuntime, reception_subagent_templates
-from app.agentscope_ext.sqlite_storage import SQLiteStorage
+from app.agentscope_ext.sqlite_storage import (
+    RUNTIME_PLACEHOLDER_CREDENTIAL_ID,
+    SQLiteStorage,
+)
 from app.agentscope_ext.workspace_manager import ManagerLocalWorkspaceManager
 from app.api.auth import router as auth_router
 from app.api.business import router as business_router
@@ -72,10 +76,22 @@ class _SessionResolver:
             row = await db.get(SessionRecordRow, (owner_user_id, session_id))
             if row is None:
                 return None
+            payload = row.storage_payload or {}
+            config = payload.get("config") if isinstance(payload, dict) else None
+            persisted_workspace_id = (
+                config.get("workspace_id") if isinstance(config, dict) else None
+            )
             return SimpleNamespace(
                 owner_user_id=row.owner_user_id,
                 agent_id=row.agent_id,
                 session_id=row.id,
+                workspace_id=(
+                    persisted_workspace_id
+                    or SQLiteStorage.workspace_id_for(
+                        row.owner_user_id,
+                        row.agent_id,
+                    )
+                ),
             )
 
 
@@ -226,6 +242,21 @@ def create_root_app(
             await create_schema(engine)
             async with sessions() as db:
                 await seed_demo_data(db)
+                manager_ids = list(
+                    await db.scalars(
+                        select(User.id).where(User.role == Role.MANAGER)
+                    )
+                )
+            for manager_id in manager_ids:
+                await storage.upsert_credential(
+                    manager_id,
+                    OpenAICredential(
+                        id=RUNTIME_PLACEHOLDER_CREDENTIAL_ID,
+                        name="RunChain runtime placeholder",
+                        api_key="non-secret-placeholder-never-called",
+                        base_url="http://127.0.0.1:9/v1",
+                    ),
+                )
 
             skill_db = sessions()
             skill_service = supplied.get("skill_service") or SkillService(
@@ -327,6 +358,31 @@ def create_root_app(
         return await call_next(request)
 
     app.mount("/internal/agentscope", agentscope_app)
+
+    @app.get("/{frontend_path:path}", include_in_schema=False)
+    async def frontend(frontend_path: str):
+        """Serve the production SPA without turning API misses into HTML."""
+        if frontend_path == "api" or frontend_path.startswith("api/"):
+            return _error(404, "NOT_FOUND", "接口不存在")
+        if frontend_path == "internal" or frontend_path.startswith("internal/"):
+            return _error(404, "NOT_FOUND", "接口不存在")
+
+        dist = settings.frontend_dist.resolve()
+        index = dist / "index.html"
+        if not index.is_file():
+            return _error(503, "FRONTEND_NOT_BUILT", "前端尚未构建")
+
+        requested = (dist / frontend_path).resolve() if frontend_path else index
+        try:
+            requested.relative_to(dist)
+        except ValueError:
+            return _error(404, "NOT_FOUND", "页面不存在")
+        if frontend_path and requested.is_file():
+            return FileResponse(requested)
+        if Path(frontend_path).suffix:
+            return _error(404, "NOT_FOUND", "静态资源不存在")
+        return FileResponse(index)
+
     return app
 
 

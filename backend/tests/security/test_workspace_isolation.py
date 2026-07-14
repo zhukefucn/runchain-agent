@@ -16,6 +16,7 @@ class SessionIdentity:
     owner_user_id: str
     agent_id: str
     session_id: str
+    workspace_id: str | None = None
 
 
 class FakeSessionResolver:
@@ -138,6 +139,37 @@ def test_explicit_workspace_binding_cannot_be_reused_across_managers(manager):
                 "manager0001", "default", "s1", workspace_id=other_workspace_id
             )
         )
+
+
+def test_team_worker_uses_its_persisted_path_safe_leader_workspace(tmp_path):
+    shared_workspace = "0123456789abcdef"
+    resolver = FakeSessionResolver(
+        {
+            ("manager0001", "worker-session"): SessionIdentity(
+                "manager0001",
+                "worker-agent",
+                "worker-session",
+                shared_workspace,
+            )
+        }
+    )
+    manager = ManagerLocalWorkspaceManager(tmp_path / "workspace", resolver)
+
+    workspace = asyncio.run(
+        manager.get_workspace(
+            "manager0001",
+            "worker-agent",
+            "worker-session",
+            workspace_id=shared_workspace,
+        )
+    )
+
+    assert workspace.workspace_id == shared_workspace
+    assert Path(workspace.workdir).parts[-3:] == (
+        "manager0001",
+        "agents",
+        "worker-agent",
+    )
 
 
 @pytest.mark.parametrize(
