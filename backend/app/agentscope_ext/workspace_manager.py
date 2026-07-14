@@ -10,6 +10,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Protocol
 
 from agentscope.app.workspace_manager import IsolationPolicy, WorkspaceManagerBase
+from agentscope.tool import ToolBase
 from agentscope.workspace import LocalWorkspace
 
 
@@ -31,11 +32,20 @@ logger = logging.getLogger(__name__)
 
 
 class _ManagerLocalWorkspace(LocalWorkspace):
-    """Local AgentScope workspace with an explicit no-helper glob contract."""
+    """Local AgentScope workspace without native process/filesystem tools.
+
+    Managers receive only tools assembled by the demo's authorization layer.
+    AgentScope's local builtins use an unrestricted host ``LocalBackend`` and
+    therefore must never be registered in this Windows Phase 1 runtime.
+    """
 
     @property
     def _glob_helper_path(self) -> None:
         return None
+
+    async def list_tools(self) -> list[ToolBase]:
+        """Expose no native Bash/Read/Write/Edit/Glob/Grep tools."""
+        return []
 
 
 class SessionIdentity(Protocol):

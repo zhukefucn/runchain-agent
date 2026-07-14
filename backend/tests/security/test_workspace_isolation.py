@@ -50,6 +50,20 @@ def test_same_agent_id_for_two_users_has_distinct_workdirs(manager):
     assert Path(two.workdir).parts[-3:] == ("manager0002", "agents", "default")
 
 
+def test_manager_workspace_exposes_no_native_filesystem_or_shell_tools(manager):
+    """Only separately governed tools may enter a manager's toolkit."""
+    workspace = asyncio.run(
+        manager.get_workspace("manager0001", "default", "s1")
+    )
+
+    tools = asyncio.run(workspace.list_tools())
+
+    assert tools == []
+    assert {getattr(tool, "name", type(tool).__name__) for tool in tools}.isdisjoint(
+        {"Bash", "Read", "Write", "Edit", "Glob", "Grep"}
+    )
+
+
 def test_same_manager_agent_sessions_share_agentscope_per_agent_workspace(manager):
     one = asyncio.run(manager.get_workspace("manager0001", "default", "s1"))
     two = asyncio.run(manager.get_workspace("manager0001", "default", "s2"))

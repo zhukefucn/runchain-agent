@@ -369,6 +369,35 @@ def test_root_app_liveness_readiness_identity_bridge_and_clean_lifespan(tmp_path
             session_id=session_id,
         )
 
+        # Native workspace management is deliberately not part of the demo's
+        # manager surface. Skills and MCP servers are installed/authorized only
+        # through the governed business-admin APIs.
+        workspace_query = f"?agent_id={agent_id}&session_id={session_id}"
+        workspace_requests = (
+            ("GET", "/internal/agentscope/workspace"),
+            ("GET", "/internal/agentscope/workspace/"),
+            ("GET", f"/internal/agentscope/workspace/mcp{workspace_query}"),
+            ("POST", f"/internal/agentscope/workspace/mcp{workspace_query}"),
+            (
+                "DELETE",
+                f"/internal/agentscope/workspace/mcp/native{workspace_query}",
+            ),
+            ("GET", f"/internal/agentscope/workspace/skill{workspace_query}"),
+            ("POST", f"/internal/agentscope/workspace/skill{workspace_query}"),
+            (
+                "DELETE",
+                f"/internal/agentscope/workspace/skill/native{workspace_query}",
+            ),
+        )
+        for method, path in workspace_requests:
+            denied = await client.request(
+                method,
+                path,
+                headers={"Authorization": f"Bearer {token}"},
+                json={} if method == "POST" else None,
+            )
+            assert denied.status_code == 404, (method, path, denied.text)
+
         # Subscribe through the actual SSE endpoint before the run; AgentScope
         # deliberately trims a completed run's replay buffer.
         stream = await stream_session_events(

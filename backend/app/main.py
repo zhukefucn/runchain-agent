@@ -416,6 +416,11 @@ def create_root_app(
     async def protect_agentscope(request: Request, call_next):
         if not request.url.path.startswith("/internal/agentscope"):
             return await call_next(request)
+        native_workspace_path = "/internal/agentscope/workspace"
+        if request.url.path == native_workspace_path or request.url.path.startswith(
+            native_workspace_path + "/"
+        ):
+            return _error(404, "NOT_FOUND", "Endpoint not found")
         _sanitize_identity_scope(request.scope)
         authorization = request.headers.get("authorization", "")
         if not authorization.startswith("Bearer "):
