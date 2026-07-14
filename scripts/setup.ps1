@@ -66,13 +66,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Installing the local demo in editable mode without resolving dependencies"
-& $venvPython -m pip install --disable-pip-version-check --no-deps --editable "${projectRoot}[dev]"
+& $venvPython -m pip install --disable-pip-version-check --no-build-isolation --no-deps --editable "${projectRoot}[dev]"
 if ($LASTEXITCODE -ne 0) {
     throw "Demo installation failed."
 }
 
 Write-Host "Installing the local AgentScope checkout in editable mode without resolving dependencies"
-& $venvPython -m pip install --disable-pip-version-check --no-deps --editable $agentscopePath
+& $venvPython -m pip install --disable-pip-version-check --no-build-isolation --no-deps --editable $agentscopePath
 if ($LASTEXITCODE -ne 0) {
     throw "AgentScope installation failed."
 }
