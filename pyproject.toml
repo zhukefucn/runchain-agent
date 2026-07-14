@@ -14,6 +14,8 @@ dependencies = [
     "fastapi==0.139.0",
     "PyJWT==2.13.0",
     "pydantic-settings==2.10.1",
+    "APScheduler==3.11.3",
+    "ag-ui-protocol==0.1.19",
 ]
 
 [project.optional-dependencies]

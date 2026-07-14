@@ -55,3 +55,16 @@ def test_auth_api_dependencies_are_exactly_pinned():
         assert f'"{pin}"' in pyproject
         assert pin in lock_lines
     assert "starlette==1.3.1" in lock_lines
+
+
+def test_agentscope_service_dependencies_are_exactly_pinned():
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text()
+    lock_lines = (PROJECT_ROOT / "requirements.lock").read_text().splitlines()
+    required_pins = [
+        "APScheduler==3.11.3",
+        "ag-ui-protocol==0.1.19",
+    ]
+
+    for pin in required_pins:
+        assert f'"{pin}"' in pyproject
+        assert pin in lock_lines
