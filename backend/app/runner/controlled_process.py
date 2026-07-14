@@ -281,8 +281,15 @@ class _WindowsJob:
         )
         if not ok:
             error = ctypes.get_last_error()
-            self.close()
-            raise ctypes.WinError(error)
+            self._raise_configuration_error(error)
+
+    def _raise_configuration_error(self, error: int) -> None:
+        if not self.close():
+            logger.error(
+                "Job configuration failed with WinError %d and close also failed",
+                error,
+            )
+        raise ctypes.WinError(error)
 
     def assign_and_resume(self, process: subprocess.Popen) -> None:
         process_handle = int(process._handle)  # type: ignore[attr-defined]
@@ -370,20 +377,20 @@ class SkillExecutor:
             skill = await self._resolver.resolve(request)
         except (SkillResolutionError, PermissionError, LookupError):
             result = self._result("not_authorized", started, "Skill is unavailable.")
-            await self._audit(request, result)
+            await self._audit_uncancellable(request, result)
             return result
 
         if skill.type != "python":
             result = self._result(
                 "unsupported_skill_type", started, "Skill type is not executable."
             )
-            await self._audit(request, result)
+            await self._audit_uncancellable(request, result)
             return result
 
         entrypoint = self._canonical_entrypoint(skill)
         if entrypoint is None:
             result = self._result("not_authorized", started, "Skill is unavailable.")
-            await self._audit(request, result)
+            await self._audit_uncancellable(request, result)
             return result
 
         try:
@@ -395,11 +402,11 @@ class SkillExecutor:
             ).encode("utf-8")
         except (TypeError, ValueError):
             result = self._result("invalid_input", started, "Skill input is invalid.")
-            await self._audit(request, result)
+            await self._audit_uncancellable(request, result)
             return result
         if len(payload) > self._limits.max_input_bytes:
             result = self._result("invalid_input", started, "Skill input is too large.")
-            await self._audit(request, result)
+            await self._audit_uncancellable(request, result)
             return result
 
         gate = _shared_gate(
@@ -413,7 +420,7 @@ class SkillExecutor:
             result = self._result(
                 "queue_timeout", started, "Skill execution queue timed out."
             )
-            await self._audit(request, result)
+            await self._audit_uncancellable(request, result)
             return result
 
         cancel_event = threading.Event()
@@ -433,25 +440,19 @@ class SkillExecutor:
                         cancelled_result = self._result(
                             "failed", started, "Skill process failed."
                         )
-                    audit_task = asyncio.create_task(
-                        self._audit(request, cancelled_result)
-                    )
-                    try:
-                        await _wait_uncancellable(audit_task)
-                    except Exception:
-                        logger.exception("Runner cancellation audit failed")
+                    await self._audit_uncancellable(request, cancelled_result)
                 finally:
                     raise
             except Exception:
                 result = self._result("failed", started, "Skill process failed.")
-                await self._audit(request, result)
+                await self._audit_uncancellable(request, result)
                 return result
 
             try:
                 result = self._convert_outcome(outcome)
             except Exception:
                 result = self._result("failed", started, "Skill process failed.")
-            await self._audit(request, result)
+            await self._audit_uncancellable(request, result)
             return result
         finally:
             gate.release()
@@ -742,6 +743,30 @@ class SkillExecutor:
         pending = self._audit_sink(event)
         if inspect.isawaitable(pending):
             await pending
+
+    async def _audit_uncancellable(
+        self, request: SkillExecutionRequest, result: SkillExecutionResult
+    ) -> None:
+        """Run exactly one audit task to completion before propagating cancel."""
+        audit_task = asyncio.create_task(self._audit(request, result))
+        cancelled = False
+        while not audit_task.done():
+            try:
+                await asyncio.shield(audit_task)
+            except asyncio.CancelledError:
+                cancelled = True
+                continue
+            except Exception:
+                break
+        if audit_task.cancelled():
+            logger.error("Runner audit task was unexpectedly cancelled")
+        else:
+            try:
+                audit_task.result()
+            except Exception:
+                logger.exception("Runner audit failed")
+        if cancelled:
+            raise asyncio.CancelledError
 
     @staticmethod
     def _elapsed(started: float) -> int:

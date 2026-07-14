@@ -389,6 +389,31 @@ async def test_audit_callback_receives_metadata_only(tmp_path):
 
 
 @async_test
+async def test_audit_sink_failure_is_logged_once_without_changing_result(
+    tmp_path, caplog
+):
+    calls = 0
+
+    async def failing_audit(_event):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("audit backend unavailable")
+
+    skill = _script_skill(tmp_path, "print('{}')\n")
+    runner = SkillExecutor(
+        resolver=StaticResolver(skill),
+        runner_root=tmp_path / "runner",
+        audit_sink=failing_audit,
+    )
+
+    result = await runner.execute(_request())
+
+    assert result.status == "success"
+    assert calls == 1
+    assert "Runner audit failed" in caplog.text
+
+
+@async_test
 async def test_runner_uses_absolute_python_isolated_argv_without_shell(
     tmp_path, monkeypatch
 ):
@@ -498,6 +523,18 @@ def test_windows_runner_root_has_protected_acl_and_child_inherits(tmp_path):
     assert child_acl.system_full_control
     assert child_acl.has_inherited_aces
     assert not child_acl.world_or_users_write
+    assert child_acl.allowlist_only
+
+
+def test_acl_allow_ace_policy_rejects_foreign_object_and_generic_all():
+    from app.runner.windows_acl import _allow_ace_is_safe
+
+    current = "S-1-5-21-demo"
+    assert _allow_ace_is_safe(0, 0x001F01FF, current, current)
+    assert _allow_ace_is_safe(0, 0x001F01FF, "S-1-5-18", current)
+    assert not _allow_ace_is_safe(0, 0x001F01FF, "S-1-1-0", current)
+    assert not _allow_ace_is_safe(5, 0x001F01FF, current, current)
+    assert not _allow_ace_is_safe(0, 0x10000000, current, current)
 
 
 @async_test
@@ -621,6 +658,22 @@ async def test_job_handle_close_failure_is_cleanup_failure_and_audited(
     assert events[0].status == "cleanup_failed"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object verification")
+def test_job_configuration_failure_preserves_config_and_close_diagnostics(
+    monkeypatch, caplog
+):
+    from app.runner.controlled_process import _WindowsJob
+
+    job = object.__new__(_WindowsJob)
+    monkeypatch.setattr(job, "close", lambda: False)
+
+    with pytest.raises(OSError):
+        job._raise_configuration_error(87)
+
+    assert "87" in caplog.text
+    assert "close" in caplog.text.lower()
+
+
 @async_test
 async def test_cancellation_terminates_process_tree_and_cleans_temp(tmp_path):
     marker = tmp_path / "child.pid"
@@ -703,6 +756,85 @@ async def test_repeated_cancellation_cannot_interrupt_cleanup_or_audit(tmp_path)
     assert not list((tmp_path / "runner").glob("call-*"))
     assert len(audits) == 1
     assert audit_completed.is_set()
+
+
+@async_test
+async def test_cancel_after_normal_result_waits_for_single_audit_and_releases_gate(tmp_path):
+    skill = _script_skill(tmp_path, "print('{}')\n")
+    audit_started = asyncio.Event()
+    audit_release = asyncio.Event()
+    audit_completed = asyncio.Event()
+    audits = []
+
+    async def audit(event):
+        audits.append(event)
+        if len(audits) == 1:
+            audit_started.set()
+            await audit_release.wait()
+            audit_completed.set()
+
+    runner = SkillExecutor(
+        resolver=StaticResolver(skill),
+        runner_root=tmp_path / "runner",
+        limits=RunnerLimits(max_concurrent_executions=1),
+        audit_sink=audit,
+    )
+    task = asyncio.create_task(runner.execute(_request()))
+    await asyncio.wait_for(audit_started.wait(), timeout=2)
+
+    task.cancel()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert not audit_completed.is_set()
+    audit_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert audit_completed.is_set()
+    assert len(audits) == 1
+    second = await runner.execute(
+        SkillExecutionRequest(
+            user_id="manager-user-1",
+            skill_id="skill-1",
+            input_data={},
+            request_id="after-cancel",
+        )
+    )
+    assert second.status == "success"
+
+
+@async_test
+async def test_cancel_during_early_denial_waits_for_exactly_one_audit(tmp_path):
+    audit_started = asyncio.Event()
+    audit_release = asyncio.Event()
+    audit_completed = asyncio.Event()
+    audits = []
+
+    async def audit(event):
+        audits.append(event)
+        audit_started.set()
+        await audit_release.wait()
+        audit_completed.set()
+
+    runner = SkillExecutor(
+        resolver=StaticResolver(error=SkillResolutionError("denied")),
+        runner_root=tmp_path / "runner",
+        audit_sink=audit,
+    )
+    task = asyncio.create_task(runner.execute(_request()))
+    await asyncio.wait_for(audit_started.wait(), timeout=2)
+
+    task.cancel()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    audit_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert audit_completed.is_set()
+    assert len(audits) == 1
 
 
 def test_request_rejects_oversized_or_non_object_input():

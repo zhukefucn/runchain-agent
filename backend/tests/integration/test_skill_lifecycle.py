@@ -240,10 +240,11 @@ def test_versions_are_distinct_duplicate_is_idempotent_and_publish_switches_acti
     async def check(db, users):
         service = SkillService(db, tmp_path / "installed")
         admin = principal(users["business_admin01"])
-        one = await service.install(admin, package("1.0.0"))
-        assert (await service.install(admin, package("1.0.0"))).id == one.id
+        upload_one = package("1.0.0")
+        one = await service.install(admin, upload_one)
+        assert (await service.install(admin, upload_one)).id == one.id
         with pytest.raises(SkillConflictError):
-            await service.install(admin, package("1.0.0") + b"different")
+            await service.install(admin, upload_one + b"different")
         two = await service.install(admin, package("2.0.0"))
         await service.publish(admin, one.id)
         await service.authorize(admin, one.id, users["manager0001"].id)

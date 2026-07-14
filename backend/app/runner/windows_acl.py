@@ -15,6 +15,18 @@ class AclInspection:
     inheritable: bool
     has_inherited_aces: bool
     world_or_users_write: bool
+    allowlist_only: bool
+
+
+def _allow_ace_is_safe(
+    ace_type: int, mask: int, sid: str, current_user_sid: str
+) -> bool:
+    """Allow only plain, mapped ACEs for current user or LocalSystem."""
+    return (
+        ace_type == 0
+        and sid in {current_user_sid, "S-1-5-18"}
+        and not mask & 0x10000000
+    )
 
 
 def _check_plain_directory(path: Path) -> None:
@@ -239,6 +251,7 @@ def inspect_windows_acl(path: Path) -> AclInspection:
         current_inheritable = system_inheritable = False
         current_inherited = system_inherited = False
         unsafe_write = False
+        allowlist_only = True
         unsafe_sids = {"S-1-1-0", "S-1-5-11", "S-1-5-32-545"}
         write_mask = 0x40000000 | 0x000D0116
         for index in range(info.AceCount):
@@ -246,12 +259,19 @@ def inspect_windows_acl(path: Path) -> AclInspection:
             if not _advapi32.GetAce(dacl, index, ctypes.byref(ace_pointer)):
                 raise _win_error()
             ace = ctypes.cast(ace_pointer, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
+            if ace.Header.AceType in {5, 9, 11}:
+                allowlist_only = False
+                continue
             if ace.Header.AceType != 0:
                 continue
             sid_pointer = ctypes.c_void_p(
                 ace_pointer.value + _ACCESS_ALLOWED_ACE.SidStart.offset
             )
             sid = _sid_string(sid_pointer)
+            if not _allow_ace_is_safe(
+                ace.Header.AceType, ace.Mask, sid, current_sid
+            ):
+                allowlist_only = False
             full = (ace.Mask & 0x001F01FF) == 0x001F01FF
             ace_inheritable = (ace.Header.AceFlags & 0x03) == 0x03
             ace_inherited = bool(ace.Header.AceFlags & 0x10)
@@ -272,6 +292,7 @@ def inspect_windows_acl(path: Path) -> AclInspection:
             inheritable=current_inheritable and system_inheritable,
             has_inherited_aces=current_inherited and system_inherited,
             world_or_users_write=unsafe_write,
+            allowlist_only=allowlist_only,
         )
     finally:
         _local_free(descriptor)
@@ -282,7 +303,7 @@ def secure_runner_root(path: Path) -> AclInspection:
     _check_plain_directory(path)
     if os.name != "nt":
         os.chmod(path, 0o700)
-        return AclInspection(True, True, True, True, False, False)
+        return AclInspection(True, True, True, True, False, False, True)
     _set_protected_dacl(path, _current_user_sid())
     _check_plain_directory(path)
     inspection = inspect_windows_acl(path)
@@ -292,6 +313,7 @@ def secure_runner_root(path: Path) -> AclInspection:
         and inspection.system_full_control
         and inspection.inheritable
         and not inspection.world_or_users_write
+        and inspection.allowlist_only
     ):
         raise OSError("runner root DACL verification failed")
     return inspection
@@ -301,13 +323,14 @@ def verify_inherited_call_directory(path: Path) -> AclInspection:
     _check_plain_directory(path)
     if os.name != "nt":
         os.chmod(path, 0o700)
-        return AclInspection(False, True, True, False, True, False)
+        return AclInspection(False, True, True, False, True, False, True)
     inspection = inspect_windows_acl(path)
     if not (
         inspection.current_user_full_control
         and inspection.system_full_control
         and inspection.has_inherited_aces
         and not inspection.world_or_users_write
+        and inspection.allowlist_only
     ):
         raise OSError("runner call directory DACL verification failed")
     return inspection
