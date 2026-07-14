@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     JSON,
@@ -50,39 +51,57 @@ class User(Base):
 
 class SessionRecordRow(Base):
     __tablename__ = "sessions"
+    __table_args__ = (PrimaryKeyConstraint("owner_user_id", "id"),)
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    id: Mapped[str] = mapped_column(String(100), default=_uuid)
     owner_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     agent_id: Mapped[str] = mapped_column(String(100))
     title: Mapped[str] = mapped_column(String(200), default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
+    source: Mapped[str] = mapped_column(String(32), default="user")
+    source_schedule_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    team_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    storage_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class MessageRow(Base):
     __tablename__ = "messages"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["owner_user_id", "session_id"],
+            ["sessions.owner_user_id", "sessions.id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("owner_user_id", "session_id", "ordinal"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    session_id: Mapped[str] = mapped_column(
-        ForeignKey("sessions.id", ondelete="CASCADE"), index=True
-    )
+    session_id: Mapped[str] = mapped_column(String(100), index=True)
     owner_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     role: Mapped[str] = mapped_column(String(32))
     content: Mapped[str] = mapped_column(Text)
+    ordinal: Mapped[int] = mapped_column(Integer, default=0)
+    storage_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class TeamRunRow(Base):
     __tablename__ = "team_runs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["owner_user_id", "session_id"],
+            ["sessions.owner_user_id", "sessions.id"],
+            ondelete="CASCADE",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    session_id: Mapped[str] = mapped_column(
-        ForeignKey("sessions.id", ondelete="CASCADE"), index=True
-    )
+    session_id: Mapped[str] = mapped_column(String(100), index=True)
     owner_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
@@ -149,14 +168,19 @@ class McpServerRow(Base):
 
 class SkillInvocationRow(Base):
     __tablename__ = "skill_invocations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["owner_user_id", "session_id"],
+            ["sessions.owner_user_id", "sessions.id"],
+            ondelete="CASCADE",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     skill_id: Mapped[str] = mapped_column(
         ForeignKey("skills.id", ondelete="RESTRICT"), index=True
     )
-    session_id: Mapped[str] = mapped_column(
-        ForeignKey("sessions.id", ondelete="CASCADE"), index=True
-    )
+    session_id: Mapped[str] = mapped_column(String(100), index=True)
     owner_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
@@ -168,11 +192,16 @@ class SkillInvocationRow(Base):
 
 class WorkspaceFileRow(Base):
     __tablename__ = "workspace_files"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["owner_user_id", "session_id"],
+            ["sessions.owner_user_id", "sessions.id"],
+            ondelete="CASCADE",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    session_id: Mapped[str] = mapped_column(
-        ForeignKey("sessions.id", ondelete="CASCADE"), index=True
-    )
+    session_id: Mapped[str] = mapped_column(String(100), index=True)
     owner_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
@@ -197,7 +226,13 @@ class AuditRecordRow(Base):
 
 
 class AgentScopeStorageRow(Base):
-    """Owner-scoped JSON records used by the AgentScope storage adapter."""
+    """Owner-scoped JSON records used by the AgentScope storage adapter.
+
+    ``parent_id`` is a heterogeneous logical reference (currently a knowledge
+    base id for document records), so SQLite cannot express one fixed FK for
+    it. The adapter validates that parent in the same owner scope before
+    creation and explicitly cascades child records when deleting the parent.
+    """
 
     __tablename__ = "agentscope_storage_records"
     __table_args__ = (
@@ -210,7 +245,9 @@ class AgentScopeStorageRow(Base):
         ),
     )
 
-    owner_user_id: Mapped[str] = mapped_column(String(100))
+    owner_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
     namespace: Mapped[str] = mapped_column(String(40))
     record_id: Mapped[str] = mapped_column(String(160))
     parent_id: Mapped[str | None] = mapped_column(String(160), nullable=True)

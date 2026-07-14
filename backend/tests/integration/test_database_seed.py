@@ -74,10 +74,7 @@ def test_schema_has_required_tables_foreign_keys_owner_indexes_and_unique_auth(t
 
         assert set(Base.metadata.tables) == EXPECTED_TABLES
         assert async_session_factory.kw["expire_on_commit"] is False
-        assert all(
-            table_details[table]
-            for table in EXPECTED_TABLES - {"users", "agentscope_storage_records"}
-        )
+        assert all(table_details[table] for table in EXPECTED_TABLES - {"users"})
         assert all(model.__table__.c.owner_user_id.index for model in OWNER_MODELS)
         assert any(
             isinstance(constraint, UniqueConstraint)

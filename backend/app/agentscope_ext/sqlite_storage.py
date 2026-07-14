@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, select, text
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentscope.app.storage import StorageBase
@@ -23,10 +24,10 @@ from agentscope.app.storage._model import (
 )
 from agentscope.app.storage._utils import _dump_with_secrets, _ensure_team_members
 from agentscope.credential import CredentialBase
-from agentscope.message import Msg
+from agentscope.message import Msg, TextBlock
 from agentscope.state import AgentState
 
-from app.db.models import AgentScopeStorageRow
+from app.db.models import AgentScopeStorageRow, MessageRow, SessionRecordRow
 from app.db.session import async_session_factory
 
 
@@ -46,6 +47,58 @@ class SQLiteStorage(StorageBase):
     @staticmethod
     def _document_key(knowledge_base_id: str, document_id: str) -> str:
         return f"{len(knowledge_base_id)}:{knowledge_base_id}{document_id}"
+
+    @staticmethod
+    def _session_from_row(row: SessionRecordRow) -> SessionRecord:
+        if row.storage_payload:
+            record = SessionRecord.model_validate(row.storage_payload)
+            record.config.name = row.title
+        else:
+            record = SessionRecord(
+                id=row.id,
+                user_id=row.owner_user_id,
+                agent_id=row.agent_id,
+                source=row.source,
+                source_schedule_id=row.source_schedule_id,
+                team_id=row.team_id,
+                config=SessionConfig(
+                    workspace_id=(
+                        f"{row.owner_user_id}/sessions/{row.id}"
+                    ),
+                    name=row.title,
+                ),
+                created_at=row.created_at,
+                updated_at=row.created_at,
+            )
+        record.user_id = row.owner_user_id
+        record.agent_id = row.agent_id
+        record.source = SessionSource(row.source)
+        record.source_schedule_id = row.source_schedule_id
+        record.team_id = row.team_id
+        record.created_at = row.created_at
+        return record
+
+    @staticmethod
+    def _message_text(msg: Msg) -> str:
+        return "\n".join(
+            block.text for block in msg.content if isinstance(block, TextBlock)
+        )
+
+    @classmethod
+    def _message_from_row(cls, row: MessageRow) -> Msg:
+        if row.storage_payload:
+            msg = Msg.model_validate(row.storage_payload)
+            if cls._message_text(msg) != row.content or msg.role != row.role:
+                msg.content = [TextBlock(type="text", text=row.content)]
+                msg.role = row.role
+            return msg
+        return Msg(
+            id=row.id,
+            name=row.role,
+            role=row.role,
+            content=[TextBlock(type="text", text=row.content)],
+            created_at=row.created_at.isoformat(),
+        )
 
     async def _get_row(
         self, owner: str, namespace: str, record_id: str
@@ -69,23 +122,28 @@ class SQLiteStorage(StorageBase):
         parent_id: str | None = None,
         ordinal: int = 0,
     ) -> None:
+        now = datetime.now()
+        statement = sqlite_insert(AgentScopeStorageRow).values(
+            owner_user_id=owner,
+            namespace=namespace,
+            record_id=record_id,
+            parent_id=parent_id,
+            ordinal=ordinal,
+            payload=payload,
+            created_at=now,
+            updated_at=now,
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=["owner_user_id", "namespace", "record_id"],
+            set_={
+                "parent_id": statement.excluded.parent_id,
+                "ordinal": statement.excluded.ordinal,
+                "payload": statement.excluded.payload,
+                "updated_at": now,
+            },
+        )
         async with self._session_factory() as db:
-            row = await db.get(AgentScopeStorageRow, (owner, namespace, record_id))
-            if row is None:
-                row = AgentScopeStorageRow(
-                    owner_user_id=owner,
-                    namespace=namespace,
-                    record_id=record_id,
-                    parent_id=parent_id,
-                    ordinal=ordinal,
-                    payload=payload,
-                )
-                db.add(row)
-            else:
-                row.payload = payload
-                row.parent_id = parent_id
-                row.ordinal = ordinal
-                row.updated_at = datetime.now()
+            await db.execute(statement)
             await db.commit()
 
     async def _list_payloads(
@@ -210,68 +268,87 @@ class SQLiteStorage(StorageBase):
         source: SessionSource = SessionSource.USER,
         source_schedule_id: str | None = None,
     ) -> SessionRecord:
-        current = (
-            await self.get_session(user_id, agent_id, session_id)
-            if session_id
-            else None
-        )
-        if current:
-            current.config = config
-            if state is not None:
-                current.state = state
-            current.updated_at = datetime.now()
-            record = current
-        else:
-            kwargs = {"id": session_id} if session_id else {}
-            record = SessionRecord(
-                user_id=user_id,
-                agent_id=agent_id,
-                config=config,
-                state=state or AgentState(),
-                source=source,
-                source_schedule_id=source_schedule_id,
-                **kwargs,
+        async with self._session_factory() as db:
+            await db.execute(text("BEGIN IMMEDIATE"))
+            row = (
+                await db.get(SessionRecordRow, (user_id, session_id))
+                if session_id
+                else None
             )
-        await self._put(
-            user_id, "session", record.id, self._dump(record), parent_id=agent_id
-        )
-        return record
+            if row is not None:
+                # Match RedisStorage: the session key is owner/session scoped;
+                # a mismatched agent argument cannot rebind its ownership.
+                record = self._session_from_row(row)
+                record.config = config
+                if state is not None:
+                    record.state = state
+                record.updated_at = datetime.now()
+                row.title = config.name
+                row.storage_payload = self._dump(record)
+            else:
+                kwargs = {"id": session_id} if session_id else {}
+                record = SessionRecord(
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    config=config,
+                    state=state or AgentState(),
+                    source=source,
+                    source_schedule_id=source_schedule_id,
+                    **kwargs,
+                )
+                db.add(
+                    SessionRecordRow(
+                        id=record.id,
+                        owner_user_id=user_id,
+                        agent_id=agent_id,
+                        title=config.name,
+                        source=source.value,
+                        source_schedule_id=source_schedule_id,
+                        storage_payload=self._dump(record),
+                        created_at=record.created_at,
+                    )
+                )
+            await db.commit()
+            return record
 
     async def set_session_team_id(
         self, user_id: str, session_id: str, team_id: str | None
     ) -> None:
-        value = await self._get_payload(user_id, "session", session_id)
-        if not value:
-            return
-        record = SessionRecord.model_validate(value)
-        if record.team_id == team_id:
-            return
-        record.team_id = team_id
-        record.updated_at = datetime.now()
-        await self._put(
-            user_id, "session", record.id, self._dump(record), parent_id=record.agent_id
-        )
+        async with self._session_factory() as db:
+            row = await db.get(SessionRecordRow, (user_id, session_id))
+            if row is None or row.team_id == team_id:
+                return
+            record = self._session_from_row(row)
+            record.team_id = team_id
+            record.updated_at = datetime.now()
+            row.team_id = team_id
+            row.storage_payload = self._dump(record)
+            await db.commit()
 
     async def update_session_state(
         self, user_id: str, agent_id: str, session_id: str, state: AgentState
     ) -> None:
-        record = await self.get_session(user_id, agent_id, session_id)
-        if record is None:
-            raise KeyError(f"Session {session_id!r} not found.")
-        record.state = state
-        record.updated_at = datetime.now()
-        await self._put(
-            user_id, "session", record.id, self._dump(record), parent_id=agent_id
-        )
+        async with self._session_factory() as db:
+            row = await db.get(SessionRecordRow, (user_id, session_id))
+            if row is None:
+                raise KeyError(f"Session {session_id!r} not found.")
+            record = self._session_from_row(row)
+            record.state = state
+            record.updated_at = datetime.now()
+            row.storage_payload = self._dump(record)
+            await db.commit()
 
     async def list_sessions(self, user_id: str, agent_id: str) -> list[SessionRecord]:
-        records = [
-            SessionRecord.model_validate(value)
-            for value in await self._list_payloads(
-                user_id, "session", parent_id=agent_id, newest_first=True
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(SessionRecordRow)
+                .where(
+                    SessionRecordRow.owner_user_id == user_id,
+                    SessionRecordRow.agent_id == agent_id,
+                )
+                .order_by(SessionRecordRow.created_at.desc(), SessionRecordRow.id)
             )
-        ]
-        return sorted(records, key=lambda item: item.created_at, reverse=True)
+            return [self._session_from_row(row) for row in rows]
 
     async def delete_session(
         self, user_id: str, agent_id: str, session_id: str
@@ -285,18 +362,9 @@ class SQLiteStorage(StorageBase):
                 await self.delete_team(user_id, team.id)
         async with self._session_factory() as db:
             await db.execute(
-                delete(AgentScopeStorageRow).where(
-                    AgentScopeStorageRow.owner_user_id == user_id,
-                    AgentScopeStorageRow.namespace == "message",
-                    AgentScopeStorageRow.parent_id == session_id,
-                )
-            )
-            await db.execute(
-                delete(AgentScopeStorageRow).where(
-                    AgentScopeStorageRow.owner_user_id == user_id,
-                    AgentScopeStorageRow.namespace == "session",
-                    AgentScopeStorageRow.record_id == session_id,
-                    AgentScopeStorageRow.parent_id == agent_id,
+                delete(SessionRecordRow).where(
+                    SessionRecordRow.owner_user_id == user_id,
+                    SessionRecordRow.id == session_id,
                 )
             )
             await db.commit()
@@ -305,24 +373,23 @@ class SQLiteStorage(StorageBase):
     async def get_session(
         self, user_id: str, agent_id: str, session_id: str
     ) -> SessionRecord | None:
-        value = await self._get_payload(user_id, "session", session_id)
-        if not value:
-            return None
-        record = SessionRecord.model_validate(value)
-        return record if record.agent_id == agent_id else None
+        async with self._session_factory() as db:
+            row = await db.get(SessionRecordRow, (user_id, session_id))
+            return self._session_from_row(row) if row else None
 
     async def list_sessions_by_schedule(
         self, user_id: str, schedule_id: str
     ) -> list[SessionRecord]:
-        records = [
-            SessionRecord.model_validate(value)
-            for value in await self._list_payloads(user_id, "session")
-        ]
-        return sorted(
-            [r for r in records if r.source_schedule_id == schedule_id],
-            key=lambda item: item.created_at,
-            reverse=True,
-        )
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(SessionRecordRow)
+                .where(
+                    SessionRecordRow.owner_user_id == user_id,
+                    SessionRecordRow.source_schedule_id == schedule_id,
+                )
+                .order_by(SessionRecordRow.created_at.desc(), SessionRecordRow.id)
+            )
+            return [self._session_from_row(row) for row in rows]
 
     async def upsert_schedule(self, user_id: str, record: ScheduleRecord) -> str:
         if record.user_id != user_id:
@@ -359,29 +426,34 @@ class SQLiteStorage(StorageBase):
 
     async def upsert_message(self, user_id: str, session_id: str, msg: Msg) -> None:
         async with self._session_factory() as db:
+            await db.execute(text("BEGIN IMMEDIATE"))
             statement = (
-                select(AgentScopeStorageRow)
+                select(MessageRow)
                 .where(
-                    AgentScopeStorageRow.owner_user_id == user_id,
-                    AgentScopeStorageRow.namespace == "message",
-                    AgentScopeStorageRow.parent_id == session_id,
+                    MessageRow.owner_user_id == user_id,
+                    MessageRow.session_id == session_id,
                 )
-                .order_by(AgentScopeStorageRow.ordinal.desc())
+                .order_by(MessageRow.ordinal.desc(), MessageRow.created_at.desc())
                 .limit(1)
             )
             last = await db.scalar(statement)
-            if last is not None and last.payload.get("id") == msg.id:
-                last.payload = self._dump(msg)
+            if (
+                last is not None
+                and self._message_from_row(last).id == msg.id
+            ):
+                last.role = msg.role
+                last.content = self._message_text(msg)
+                last.storage_payload = self._dump(msg)
             else:
                 ordinal = (last.ordinal + 1) if last else 0
                 db.add(
-                    AgentScopeStorageRow(
+                    MessageRow(
                         owner_user_id=user_id,
-                        namespace="message",
-                        record_id=f"{session_id}:{ordinal:020d}",
-                        parent_id=session_id,
+                        session_id=session_id,
+                        role=msg.role,
+                        content=self._message_text(msg),
                         ordinal=ordinal,
-                        payload=self._dump(msg),
+                        storage_payload=self._dump(msg),
                     )
                 )
             await db.commit()
@@ -389,10 +461,19 @@ class SQLiteStorage(StorageBase):
     async def get_message(
         self, user_id: str, session_id: str, message_id: str
     ) -> Msg | None:
-        values = await self._list_payloads(user_id, "message", parent_id=session_id)
-        for value in reversed(values):
-            if value.get("id") == message_id:
-                return Msg.model_validate(value)
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(MessageRow)
+                .where(
+                    MessageRow.owner_user_id == user_id,
+                    MessageRow.session_id == session_id,
+                )
+                .order_by(MessageRow.ordinal.desc(), MessageRow.created_at.desc())
+            )
+            for row in rows:
+                msg = self._message_from_row(row)
+                if msg.id == message_id:
+                    return msg
         return None
 
     async def list_messages(
@@ -402,21 +483,22 @@ class SQLiteStorage(StorageBase):
             return []
         async with self._session_factory() as db:
             statement = (
-                select(AgentScopeStorageRow)
+                select(MessageRow)
                 .where(
-                    AgentScopeStorageRow.owner_user_id == user_id,
-                    AgentScopeStorageRow.namespace == "message",
-                    AgentScopeStorageRow.parent_id == session_id,
+                    MessageRow.owner_user_id == user_id,
+                    MessageRow.session_id == session_id,
                 )
-                .order_by(AgentScopeStorageRow.ordinal.asc())
+                .order_by(MessageRow.ordinal, MessageRow.created_at, MessageRow.id)
                 .offset(offset)
                 .limit(limit)
             )
-            return [Msg.model_validate(row.payload) for row in await db.scalars(statement)]
+            return [self._message_from_row(row) for row in await db.scalars(statement)]
 
     async def upsert_team(self, user_id: str, record: TeamRecord) -> TeamRecord:
         if record.user_id != user_id:
             raise ValueError("record.user_id does not match user_id")
+        if any(member.owner_id != user_id for member in record.data.members):
+            raise ValueError("team members must be owned by the team user")
         current = await self.get_team(user_id, record.id)
         if current:
             record.created_at = current.created_at
@@ -440,11 +522,9 @@ class SQLiteStorage(StorageBase):
             return False
         for member in await _ensure_team_members(self, user_id, team):
             if member.role == "created":
-                await self.delete_agent(member.owner_id, member.agent_id)
+                await self.delete_agent(user_id, member.agent_id)
             else:
-                await self.delete_session(
-                    member.owner_id, member.agent_id, member.session_id
-                )
+                await self.delete_session(user_id, member.agent_id, member.session_id)
         await self.set_session_team_id(user_id, team.session_id, None)
         return await self._delete(user_id, "team", team_id)
 
@@ -486,6 +566,11 @@ class SQLiteStorage(StorageBase):
     ) -> KnowledgeDocumentRecord:
         if record.user_id != user_id:
             raise ValueError("record.user_id does not match user_id")
+        if (
+            await self.get_knowledge_base(user_id, record.knowledge_base_id)
+            is None
+        ):
+            raise ValueError("knowledge document parent does not exist for owner")
         current = await self.get_knowledge_document(
             user_id, record.knowledge_base_id, record.id
         )
@@ -544,17 +629,30 @@ class SQLiteStorage(StorageBase):
         error: str | None = None,
         chunk_count: int | None = None,
     ) -> None:
-        record = await self.get_knowledge_document(
-            user_id, knowledge_base_id, document_id
-        )
-        if record is None:
-            return
-        record.data.status = status
-        if error is not None:
-            record.data.error = error
-        if chunk_count is not None:
-            record.data.chunk_count = chunk_count
-        await self.upsert_knowledge_document(user_id, record)
+        key = self._document_key(knowledge_base_id, document_id)
+        async with self._session_factory() as db:
+            await db.execute(text("BEGIN IMMEDIATE"))
+            row = await db.get(
+                AgentScopeStorageRow, (user_id, "knowledge_document", key)
+            )
+            if row is None:
+                await db.rollback()
+                return
+            record = KnowledgeDocumentRecord.model_validate(row.payload)
+            if record.knowledge_base_id != knowledge_base_id:
+                await db.rollback()
+                return
+            record.data.status = status
+            if error is not None:
+                record.data.error = error
+            if chunk_count is not None:
+                record.data.chunk_count = chunk_count
+            record.updated_at = datetime.now()
+            # Only status fields change on the freshly re-read record, so a
+            # concurrent lease owner/deadline can never be overwritten by a
+            # stale full-record write.
+            row.payload = self._dump(record)
+            await db.commit()
 
     async def acquire_knowledge_document_lease(
         self,

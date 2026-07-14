@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 from app.db.models import (
     AuditRecordRow,
@@ -176,30 +177,9 @@ def test_inconsistent_parent_and_child_owner_is_never_exposed(tmp_path, kind):
                 status="pending",
             )
         db.add(child)
-        await db.commit()
-        await db.refresh(child)
-
-        if kind == "message":
-            assert await repo.get_message("manager0002", child.id) is None
-            assert await repo.list_messages("manager0002", session.id) == []
-            assert await repo.update_message(
-                "manager0002", child.id, content="tampered"
-            ) is False
-            assert await repo.delete_message("manager0002", child.id) is False
-        elif kind == "file":
-            assert await repo.get_workspace_file("manager0002", child.id) is None
-            assert await repo.list_workspace_files("manager0002", session.id) == []
-            assert await repo.update_workspace_file(
-                "manager0002", child.id, relative_path="outputs/tampered.txt"
-            ) is False
-            assert await repo.delete_workspace_file("manager0002", child.id) is False
-        else:
-            assert await repo.get_team_run("manager0002", child.id) is None
-            assert await repo.list_team_runs("manager0002", session.id) == []
-            assert await repo.update_team_run(
-                "manager0002", child.id, status="completed"
-            ) is False
-            assert await repo.delete_team_run("manager0002", child.id) is False
+        with pytest.raises(IntegrityError):
+            await db.commit()
+        await db.rollback()
 
     asyncio.run(_with_repositories(tmp_path, check))
 

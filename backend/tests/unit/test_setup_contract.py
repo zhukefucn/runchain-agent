@@ -63,6 +63,7 @@ def test_agentscope_service_dependencies_are_exactly_pinned():
     required_pins = [
         "APScheduler==3.11.3",
         "ag-ui-protocol==0.1.19",
+        "uvicorn==0.51.0",
     ]
 
     for pin in required_pins:

@@ -5,7 +5,9 @@ from typing import Literal
 
 import pytest
 from pydantic import SecretStr
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentscope.agent import ContextConfig, ReActConfig
 from agentscope.app.storage._model import (
@@ -30,7 +32,9 @@ from agentscope.message import TextBlock
 from agentscope.state import AgentState
 
 from app.agentscope_ext.sqlite_storage import SQLiteStorage
+from app.db.models import AgentScopeStorageRow, MessageRow, Role, User
 from app.db.session import build_async_engine, create_schema
+from app.repositories.manager import ManagerRepository
 from agentscope.app.storage import StorageBase
 
 
@@ -57,11 +61,40 @@ def _config(name: str = "session") -> SessionConfig:
     return SessionConfig(workspace_id=f"workspace-{name}", name=name)
 
 
+def _knowledge_base(owner: str, record_id: str) -> KnowledgeBaseRecord:
+    return KnowledgeBaseRecord(
+        id=record_id,
+        user_id=owner,
+        name=record_id,
+        embedding_model_config=EmbeddingModelConfig(
+            type="demo",
+            credential_id="credential",
+            model="embedding",
+            dimensions=3,
+        ),
+        collection_name=f"collection_{owner}_{record_id}",
+    )
+
+
 async def _with_storage(tmp_path, check):
     engine = build_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'storage.db'}")
     try:
         await create_schema(engine)
-        storage = SQLiteStorage(async_sessionmaker(engine, expire_on_commit=False))
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as db:
+            db.add_all(
+                [
+                    User(
+                        id=owner,
+                        username=owner,
+                        password_hash="test-only",
+                        role=Role.MANAGER,
+                    )
+                    for owner in ("manager0001", "manager0002")
+                ]
+            )
+            await db.commit()
+        storage = SQLiteStorage(factory)
         await check(storage)
     finally:
         await engine.dispose()
@@ -107,6 +140,28 @@ def test_credentials_and_agents_round_trip_with_owner_isolation(tmp_path) -> Non
         assert not await storage.delete_credential("manager0002", "same")
         assert await storage.delete_credential("manager0001", "same")
 
+        competing = [_agent("manager0002", "atomic") for _ in range(8)]
+        for index, record in enumerate(competing):
+            record.data.name = f"version-{index}"
+        await asyncio.gather(
+            *(storage.upsert_agent("manager0002", record) for record in competing)
+        )
+        assert (await storage.get_agent("manager0002", "atomic")).data.name.startswith(
+            "version-"
+        )
+
+        with pytest.raises(IntegrityError):
+            await storage.upsert_agent("missing-owner", _agent("missing-owner", "x"))
+        async with storage._session_factory() as db:
+            await db.execute(delete(User).where(User.id == "manager0002"))
+            await db.commit()
+            remaining = await db.scalar(
+                select(func.count()).select_from(AgentScopeStorageRow).where(
+                    AgentScopeStorageRow.owner_user_id == "manager0002"
+                )
+            )
+        assert remaining == 0
+
     asyncio.run(_with_storage(tmp_path, check))
 
 
@@ -118,7 +173,11 @@ def test_sessions_messages_and_schedules_match_merge_and_sorting_contract(tmp_pa
         await storage.upsert_session(
             "manager0002", "agent", _config("other"), session_id="shared"
         )
-        assert await storage.get_session("manager0002", "wrong-agent", "shared") is None
+        rebound = await storage.upsert_session(
+            "manager0001", "other-agent", _config("renamed"), session_id="shared"
+        )
+        assert rebound.agent_id == "agent"
+        assert (await storage.get_session("manager0001", "wrong-agent", "shared")).agent_id == "agent"
         state = AgentState(session_id="shared", summary="persisted")
         await storage.update_session_state("manager0001", "agent", "shared", state)
         assert (await storage.get_session("manager0001", "agent", "shared")).state == state
@@ -126,6 +185,21 @@ def test_sessions_messages_and_schedules_match_merge_and_sorting_contract(tmp_pa
             await storage.update_session_state(
                 "manager0002", "agent", "not-found", AgentState()
             )
+        await storage.update_session_state(
+            "manager0001", "wrong-agent", "shared", AgentState(summary="wrong-agent-ok")
+        )
+        assert (await storage.get_session(
+            "manager0001", "agent", "shared"
+        )).state.summary == "wrong-agent-ok"
+        await storage.upsert_session(
+            "manager0001", "agent", _config("delete"), session_id="delete-wrong"
+        )
+        assert await storage.delete_session(
+            "manager0001", "wrong-agent", "delete-wrong"
+        )
+        assert await storage.get_session(
+            "manager0001", "agent", "delete-wrong"
+        ) is None
 
         msg = Msg(
             id="reply",
@@ -199,6 +273,48 @@ def test_team_cascade_and_knowledge_document_lifecycle(tmp_path) -> None:
             await storage.upsert_session(
                 owner, agent_id, _config(agent_id), session_id=f"{agent_id}-session"
             )
+        await storage.upsert_agent(
+            "manager0002", _agent("manager0002", "foreign-agent")
+        )
+        await storage.upsert_session(
+            "manager0002",
+            "foreign-agent",
+            _config("foreign"),
+            session_id="foreign-session",
+        )
+        malicious_team = TeamRecord(
+            id="malicious-team",
+            user_id=owner,
+            session_id="leader-session",
+            data=TeamData(
+                name="malicious",
+                members=[
+                    TeamMember(
+                        owner_id="manager0002",
+                        agent_id="foreign-agent",
+                        session_id="foreign-session",
+                        role="created",
+                    )
+                ],
+            ),
+        )
+        with pytest.raises(ValueError):
+            await storage.upsert_team(owner, malicious_team)
+        assert await storage.get_team(owner, "malicious-team") is None
+        assert await storage.get_agent("manager0002", "foreign-agent") is not None
+        # Defensive read path: even a corrupt record left by an older build
+        # cannot use its untrusted member.owner_id to delete another manager.
+        await storage._put(
+            owner,
+            "team",
+            "legacy-corrupt-team",
+            storage._dump(malicious_team.model_copy(update={"id": "legacy-corrupt-team"})),
+        )
+        assert await storage.delete_team(owner, "legacy-corrupt-team")
+        assert await storage.get_agent("manager0002", "foreign-agent") is not None
+        assert await storage.get_session(
+            "manager0002", "foreign-agent", "foreign-session"
+        ) is not None
         team = TeamRecord(
             id="team",
             user_id=owner,
@@ -303,19 +419,162 @@ def test_team_cascade_and_knowledge_document_lifecycle(tmp_path) -> None:
             ),
         )
         assert sum(lease_results) == 1
+        leased = await storage.get_knowledge_document(owner, "kb", "document")
+        lease_owner = leased.processing_node
+        lease_deadline = leased.data.lease_expires_at
         await storage.update_knowledge_document_status(
             owner, "kb", "document", "ready", chunk_count=2
         )
         loaded = await storage.get_knowledge_document(owner, "kb", "document")
         assert loaded.data.status == "ready" and loaded.data.chunk_count == 2
+        assert loaded.processing_node == lease_owner
+        assert loaded.data.lease_expires_at == lease_deadline
         assert await storage.delete_knowledge_base(owner, "kb")
         assert await storage.get_knowledge_document(owner, "kb", "document") is None
 
     asyncio.run(_with_storage(tmp_path, check))
 
 
+def test_concurrent_messages_are_serialized_without_loss_or_duplicate_ordinals(
+    tmp_path,
+) -> None:
+    async def check(storage: SQLiteStorage) -> None:
+        await storage.upsert_session(
+            "manager0001", "agent", _config("concurrent"), session_id="concurrent"
+        )
+        messages = [
+            Msg(
+                id=f"message-{index}",
+                name="user",
+                role="user",
+                content=[TextBlock(type="text", text=str(index))],
+            )
+            for index in range(12)
+        ]
+        await asyncio.gather(
+            *(
+                storage.upsert_message("manager0001", "concurrent", message)
+                for message in messages
+            )
+        )
+        stored = await storage.list_messages("manager0001", "concurrent")
+        assert {item.id for item in stored} == {item.id for item in messages}
+        async with storage._session_factory() as db:
+            ordinals = list(
+                await db.scalars(
+                    select(MessageRow.ordinal).where(
+                        MessageRow.owner_user_id == "manager0001",
+                        MessageRow.session_id == "concurrent",
+                    )
+                )
+            )
+        assert len(ordinals) == len(set(ordinals)) == 12
+
+        await storage.upsert_session(
+            "manager0001", "agent", _config("merge"), session_id="merge"
+        )
+        same_id = [
+            Msg(
+                id="same-reply",
+                name="assistant",
+                role="assistant",
+                content=[TextBlock(type="text", text=f"version-{index}")],
+            )
+            for index in range(8)
+        ]
+        await asyncio.gather(
+            *(storage.upsert_message("manager0001", "merge", item) for item in same_id)
+        )
+        merged = await storage.list_messages("manager0001", "merge")
+        assert len(merged) == 1 and merged[0].id == "same-reply"
+
+    asyncio.run(_with_storage(tmp_path, check))
+
+
+def test_manager_repository_and_adapter_share_canonical_sessions_and_messages(
+    tmp_path,
+) -> None:
+    async def check(storage: SQLiteStorage) -> None:
+        adapter_session = await storage.upsert_session(
+            "manager0001", "adapter-agent", _config("adapter"), session_id="adapter-session"
+        )
+        async with storage._session_factory() as db:
+            repository = ManagerRepository(db)
+            visible = await repository.get_session("manager0001", adapter_session.id)
+            assert visible is not None and visible.agent_id == "adapter-agent"
+            repository_session = await repository.create_session(
+                "manager0001", "repository-agent", "repository"
+            )
+
+        restored = await storage.get_session(
+            "manager0001", "repository-agent", repository_session.id
+        )
+        assert restored is not None and restored.config.name == "repository"
+
+        await storage.upsert_message(
+            "manager0001",
+            repository_session.id,
+            Msg(
+                id="adapter-message",
+                name="assistant",
+                role="assistant",
+                content=[TextBlock(type="text", text="from adapter")],
+            ),
+        )
+        async with storage._session_factory() as db:
+            repository = ManagerRepository(db)
+            rows = await repository.list_messages(
+                "manager0001", repository_session.id
+            )
+            assert len(rows) == 1 and rows[0].content == "from adapter"
+            repository_message = await repository.create_message(
+                "manager0001",
+                repository_session.id,
+                role="user",
+                content="from repository",
+            )
+            assert repository_message is not None
+
+        visible_messages = await storage.list_messages(
+            "manager0001", repository_session.id
+        )
+        assert [item.content[0].text for item in visible_messages] == [
+            "from adapter",
+            "from repository",
+        ]
+        async with storage._session_factory() as db:
+            duplicate_count = await db.scalar(
+                select(func.count()).select_from(AgentScopeStorageRow).where(
+                    AgentScopeStorageRow.namespace.in_(["session", "message"])
+                )
+            )
+        assert duplicate_count == 0
+
+    asyncio.run(_with_storage(tmp_path, check))
+
+
 def test_document_identity_includes_owner_and_knowledge_base(tmp_path) -> None:
     async def check(storage: SQLiteStorage) -> None:
+        for owner, kb_id in (
+            ("manager0001", "kb-a"),
+            ("manager0001", "kb-b"),
+            ("manager0002", "kb-a"),
+        ):
+            await storage.upsert_knowledge_base(
+                owner, _knowledge_base(owner, kb_id)
+            )
+        with pytest.raises(ValueError):
+            await storage.upsert_knowledge_document(
+                "manager0001",
+                KnowledgeDocumentRecord(
+                    id="orphan",
+                    user_id="manager0001",
+                    knowledge_base_id="missing-kb",
+                    data=KnowledgeDocumentData(
+                        filename="orphan.txt", size=1, blob_uri="local://orphan"
+                    ),
+                ),
+            )
         for owner, kb_id, filename in (
             ("manager0001", "kb-a", "a.txt"),
             ("manager0001", "kb-b", "b.txt"),

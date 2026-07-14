@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import delete, exists, select, update
+from sqlalchemy import delete, exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -126,11 +126,18 @@ class ManagerRepository:
     ) -> MessageRow | None:
         if await self.get_session(owner_user_id, session_id) is None:
             return None
+        ordinal = await self._db.scalar(
+            select(func.coalesce(func.max(MessageRow.ordinal), -1) + 1).where(
+                MessageRow.owner_user_id == owner_user_id,
+                MessageRow.session_id == session_id,
+            )
+        )
         row = MessageRow(
             session_id=session_id,
             owner_user_id=owner_user_id,
             role=role,
             content=content,
+            ordinal=ordinal,
         )
         self._db.add(row)
         await self._db.commit()
@@ -147,7 +154,7 @@ class ManagerRepository:
                 MessageRow.owner_user_id == owner_user_id,
                 self._parent_is_owned(MessageRow, owner_user_id),
             )
-            .order_by(MessageRow.created_at, MessageRow.id)
+            .order_by(MessageRow.ordinal, MessageRow.created_at, MessageRow.id)
         )
         return list(await self._db.scalars(statement))
 
