@@ -337,7 +337,17 @@ def test_manager_stream_close_is_repeat_cancel_safe(tmp_path):
     asyncio.run(scenario())
 
 
-def test_manager_chat_sse_hitl_and_terminal_messages_are_persisted(tmp_path):
+@pytest.mark.parametrize(
+    ("decision_value", "modifications", "expected_status"),
+    [
+        ("approve", None, "approved"),
+        ("reject", None, "rejected"),
+        ("modification", {"lodging": {"hotel": "Modified Hotel"}}, "modified"),
+    ],
+)
+def test_manager_chat_sse_hitl_and_terminal_messages_are_persisted(
+    tmp_path, decision_value, modifications, expected_status
+):
     async def scenario():
         async with _client(tmp_path) as (client, app):
             headers = await _auth(client, "manager0001")
@@ -370,10 +380,10 @@ def test_manager_chat_sse_hitl_and_terminal_messages_are_persisted(tmp_path):
             decision = await client.post(
                 f"/api/manager/hitl/{pending['data']['request_id']}/decision",
                 headers=headers,
-                json={"decision": "approve"},
+                json={"decision": decision_value, "modifications": modifications},
             )
             assert decision.status_code == 200
-            assert decision.json()["status"] == "approved"
+            assert decision.json()["status"] == expected_status
             assert [event["type"] for event in decision.json()["events"]] == [
                 "token",
                 "complete",
@@ -382,17 +392,19 @@ def test_manager_chat_sse_hitl_and_terminal_messages_are_persisted(tmp_path):
             messages = await client.get(
                 f"/api/manager/sessions/{session_id}/messages", headers=headers
             )
-            assert [item["role"] for item in messages.json()["items"]] == [
-                "user",
-                "assistant",
-            ]
+            items = messages.json()["items"]
+            assert [item["role"] for item in items] == ["user", "assistant", "assistant", "assistant"]
+            resumed, terminal = [json.loads(item["content"]) for item in items[-2:]]
+            assert resumed["type"] == "token"
+            assert terminal["type"] == "complete"
+            assert terminal["data"]["decision"] == decision_value
             async with app.state.session_factory() as db:
                 stored = list(
                     await db.scalars(
                         select(MessageRow).where(MessageRow.session_id == session_id)
                     )
                 )
-            assert len(stored) == 2
+            assert len(stored) == 4
 
     asyncio.run(scenario())
 

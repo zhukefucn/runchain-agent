@@ -56,14 +56,17 @@ export const useAuthStore = defineStore("auth", () => {
   }
 
   async function logout() {
-    await abortAllStreams();
     clearToken();
     principal.value = null;
     displayName.value = "";
+    await abortAllStreams();
   }
 
-  async function expire() {
-    await logout();
+  function expire() {
+    clearToken();
+    principal.value = null;
+    displayName.value = "";
+    void abortAllStreams();
   }
 
   function hydrateForTest(token: string, value: Principal) {

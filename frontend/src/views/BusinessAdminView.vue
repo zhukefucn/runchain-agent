@@ -28,6 +28,7 @@ onMounted(load);
       <template v-else><section class="data-card"><div class="card-title"><h2>最近调用</h2><span>仅元数据</span></div><div class="table-wrap"><table><thead><tr><th>Skill ID</th><th>客户经理</th><th>会话</th><th>状态</th><th>时间</th></tr></thead><tbody><tr v-for="row in invocations" :key="row.id"><td>{{row.skill_id}}</td><td>{{row.owner_user_id}}</td><td>{{row.session_id}}</td><td><span class="tag published">{{row.status}}</span></td><td>{{row.created_at||'—'}}</td></tr><tr v-if="!invocations.length"><td colspan="5" class="table-empty">暂无调用记录</td></tr></tbody></table></div></section></template>
     </section>
     <div class="operation-feedback" aria-live="polite">
+      <p v-if="busy" class="status-badge">处理中…</p>
       <template v-for="skill in skills" :key="`warnings-${skill.id}`"><p v-for="warning in skill.validation_warnings" :key="warning" class="alert warning">{{ warning }}</p></template>
       <template v-for="server in mcps" :key="`tools-${server.id}`"><span v-for="tool in server.tools" :key="tool.name" class="tag published"><strong>{{ tool.name }}</strong><small v-if="tool.description">{{ tool.description }}</small></span></template>
     </div>

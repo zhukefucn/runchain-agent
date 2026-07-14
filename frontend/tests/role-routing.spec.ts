@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/vue";
 import { createTestingApp, jsonResponse } from "./test-app";
 import { expect, it } from "vitest";
 import { apiRequest } from "@/api/client";
+import { useChatStore } from "@/stores/chat";
 import { vi } from "vitest";
 
 const cases = [
@@ -41,4 +42,23 @@ it("clears the complete auth session and returns to login on API 401", async () 
   await waitFor(() => expect(router.currentRoute.value.path).toBe("/login"));
   expect(auth.principal).toBeNull();
   expect(localStorage.getItem("runchain_token")).toBeNull();
+});
+
+it("does not deadlock when the active chat stream returns 401", async () => {
+  const { router, auth } = createTestingApp({ username: "manager0001", role: "manager", authenticated: true });
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/sessions")) return jsonResponse({ items: [{ id: "s1", title: "stream", status: "active", agent_id: "reception-leader" }] });
+    if (url.endsWith("/messages") || url.endsWith("/skills") || url.endsWith("/files")) return jsonResponse({ items: [] });
+    if (url.endsWith("/chat")) return jsonResponse({ code: "TOKEN_INVALID", message: "expired" }, 401);
+    throw new Error(url);
+  }));
+  const store = useChatStore();
+  await store.load();
+  await Promise.race([
+    store.send("test"),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("stream 401 deadlocked")), 500)),
+  ]);
+  await waitFor(() => expect(router.currentRoute.value.path).toBe("/login"));
+  expect(auth.principal).toBeNull();
 });

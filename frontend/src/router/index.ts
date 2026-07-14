@@ -12,10 +12,10 @@ const routes: RouteRecordRaw[] = [
 
 export function createAppRouter() {
   const router = createRouter({ history: createWebHistory(), routes });
-  setUnauthorizedHandler(async () => {
+  setUnauthorizedHandler(() => {
     const auth = useAuthStore();
-    await auth.expire();
-    if (router.currentRoute.value.path !== "/login") await router.replace("/login");
+    auth.expire();
+    if (router.currentRoute.value.path !== "/login") void router.replace("/login");
   });
   router.beforeEach(async (to) => {
     const auth = useAuthStore();

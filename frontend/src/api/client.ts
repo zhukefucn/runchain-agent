@@ -30,9 +30,9 @@ export function setUnauthorizedHandler(handler?: () => Promise<void> | void) {
   unauthorizedHandler = handler;
 }
 
-async function handleUnauthorized() {
+function handleUnauthorized() {
   clearToken();
-  await unauthorizedHandler?.();
+  unauthorizedHandler?.();
 }
 
 function authorizedHeaders(headers?: HeadersInit) {
@@ -59,7 +59,7 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
   }
   const response = await fetch(path, { ...init, headers });
   if (!response.ok) {
-    if (response.status === 401) await handleUnauthorized();
+    if (response.status === 401) handleUnauthorized();
     throw await toApiError(response);
   }
   if (response.status === 204) return undefined as T;
@@ -72,7 +72,7 @@ export async function apiStream(path: string, init: RequestInit = {}) {
   if (init.body && typeof init.body === "string") headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...init, headers });
   if (!response.ok) {
-    if (response.status === 401) await handleUnauthorized();
+    if (response.status === 401) handleUnauthorized();
     throw await toApiError(response);
   }
   return response;

@@ -83,6 +83,26 @@ describe("manager workspace", () => {
     expect(screen.getByRole("button", { name: "确认方案" })).toBeInTheDocument();
   });
 
+  it("reconstructs a later persisted decision and renders the structured final reception plan", async () => {
+    const pending = { type: "hitl_pending", request_id: "req-p", session_id: "s1", run_id: "r1", data: { request_id: "hitl-p", summary: {} } };
+    const resumed = { type: "token", request_id: "hitl-p", session_id: "s1", run_id: "r1", data: { phase: "resumed", decision: "approve" } };
+    const complete = { type: "complete", request_id: "hitl-p", session_id: "s1", run_id: "r1", data: { decision: "approve", status: "approved", plan: { pickup: { vehicle: "商务车", time: "18:00" }, lodging: { hotel: "演示酒店" }, dining: { restaurant: "迎宾餐厅" } } } };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/sessions")) return jsonResponse({ items: [{ id: "s1", title: "已确认接待", status: "active", agent_id: "reception-leader" }] });
+      if (url.endsWith("/messages")) return jsonResponse({ items: [pending, resumed, complete].map((event, index) => ({ id: `m${index}`, role: "assistant", content: JSON.stringify(event) })) });
+      if (url.endsWith("/skills") || url.endsWith("/files")) return jsonResponse({ items: [] });
+      throw new Error(url);
+    }));
+    const { pinia } = createTestingApp({ username: "manager0001", role: "manager", authenticated: true });
+    render(ManagerView, { global: { plugins: [pinia] } });
+    expect(await screen.findByRole("heading", { name: "最终接待方案" })).toBeInTheDocument();
+    expect(screen.getByText("商务车")).toBeInTheDocument();
+    expect(screen.getByText("演示酒店")).toBeInTheDocument();
+    expect(screen.getByText("迎宾餐厅")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "确认方案" })).not.toBeInTheDocument();
+  });
+
   it.each([
     ["confirm", "approve", "方案已确认"],
     ["cancel", "reject", "方案已取消"],

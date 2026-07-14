@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from copy import deepcopy
 from datetime import datetime, timezone
+import json
 from typing import Any, Literal
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db.models import HitlRequestRow, SessionRecordRow, TeamRunRow
+from app.db.models import HitlRequestRow, MessageRow, SessionRecordRow, TeamRunRow
 from .sse import StableEvent
 
 
@@ -152,6 +153,26 @@ class HitlService:
                 ),
             )
             payload = {"events": [event.model_dump(mode="json") for event in events]}
+            next_ordinal = await db.scalar(
+                select(func.coalesce(func.max(MessageRow.ordinal), -1) + 1).where(
+                    MessageRow.owner_user_id == owner_user_id,
+                    MessageRow.session_id == run.session_id,
+                )
+            )
+            for offset, event in enumerate(events):
+                db.add(
+                    MessageRow(
+                        session_id=run.session_id,
+                        owner_user_id=owner_user_id,
+                        role="assistant",
+                        content=json.dumps(
+                            event.model_dump(mode="json"),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        ordinal=int(next_ordinal or 0) + offset,
+                    )
+                )
             await db.execute(
                 update(HitlRequestRow)
                 .where(
