@@ -23,3 +23,17 @@ def test_editable_installs_use_locked_build_tooling():
     for command in editable_installs:
         assert "--no-build-isolation" in command
         assert "--no-deps" in command
+
+
+def test_database_dependencies_are_exactly_pinned():
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text()
+    lock_lines = (PROJECT_ROOT / "requirements.lock").read_text().splitlines()
+    required_pins = [
+        "SQLAlchemy==2.0.44",
+        "aiosqlite==0.21.0",
+        "argon2-cffi==25.1.0",
+    ]
+
+    for pin in required_pins:
+        assert f'"{pin}"' in pyproject
+        assert pin in lock_lines
