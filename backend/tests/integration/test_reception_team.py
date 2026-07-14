@@ -516,6 +516,8 @@ async def _assert_setup_failure_is_sanitized_and_terminal(
 
 @_async_test
 async def test_team_create_failure_is_sanitized_and_terminal(tmp_path):
+    from agentscope.message import TextBlock, ToolResultState
+    from agentscope.tool import ToolChunk
     from app.agents.reception import ReceptionTeamRuntime
 
     class FailingTeamCreate:
@@ -523,7 +525,10 @@ async def test_team_create_failure_is_sanitized_and_terminal(tmp_path):
             pass
 
         async def __call__(self, **_kwargs):
-            raise RuntimeError("secret=team-create-key")
+            return ToolChunk(
+                content=[TextBlock(text="secret=team-create-key")],
+                state=ToolResultState.ERROR,
+            )
 
     engine, sessions, users = await _runtime_db(tmp_path)
     owner = users["manager0001"].id
@@ -574,6 +579,58 @@ async def test_partial_agent_create_failure_is_sanitized_and_terminal(tmp_path):
     await _assert_setup_failure_is_sanitized_and_terminal(
         sessions, owner, "failed-partial-agent-create", events
     )
+    storage = SQLiteStorage(sessions)
+    leader = await storage.get_session(
+        owner, "reception-leader", "reception-session-1"
+    )
+    team = await storage.get_team(owner, leader.team_id)
+    assert len(team.data.members) == 1
+    await engine.dispose()
+
+
+@_async_test
+async def test_agent_create_error_chunk_after_roster_write_is_terminal(tmp_path):
+    from agentscope.app.message_bus import InMemoryMessageBus
+    from app.agents.reception import ReceptionTeamRuntime
+
+    class FailingRunTriggerBus(InMemoryMessageBus):
+        def __init__(self):
+            super().__init__()
+            self.queue_push_calls = 0
+
+        async def queue_push(self, key, payload, *, ttl_secs=None):
+            self.queue_push_calls += 1
+            if self.queue_push_calls == 2:
+                raise RuntimeError("secret=run-trigger-key")
+            return await super().queue_push(
+                key, payload, ttl_secs=ttl_secs
+            )
+
+    engine, sessions, users = await _runtime_db(tmp_path)
+    owner = users["manager0001"].id
+    events = await _collect(
+        ReceptionTeamRuntime(
+            sessions, message_bus=FailingRunTriggerBus()
+        ).chat(
+            owner,
+            "reception-session-1",
+            "message bus failure",
+            request_id="failed-agent-error-chunk",
+        )
+    )
+    await _assert_setup_failure_is_sanitized_and_terminal(
+        sessions, owner, "failed-agent-error-chunk", events
+    )
+    assert all(event.type != "hitl_pending" for event in events)
+    async with sessions() as db:
+        run = await db.scalar(
+            select(TeamRunRow).where(
+                TeamRunRow.request_id == "failed-agent-error-chunk"
+            )
+        )
+        assert await db.scalar(
+            select(HitlRequestRow).where(HitlRequestRow.team_run_id == run.id)
+        ) is None
     storage = SQLiteStorage(sessions)
     leader = await storage.get_session(
         owner, "reception-leader", "reception-session-1"

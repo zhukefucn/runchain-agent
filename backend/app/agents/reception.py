@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agentscope.app import SubAgentTemplate
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBus
 from agentscope.app.storage import StorageBase
+from agentscope.message import ToolResultState
+from agentscope.tool import ToolChunk
 
 from app.db.models import HitlRequestRow, Role, SessionRecordRow, TeamNodeRunRow, TeamRunRow, User
 from app.agentscope_ext.sqlite_storage import SQLiteStorage
@@ -29,6 +31,17 @@ _TOOL_PATHS = {
     "lodging": ("in_process_mock_tool", "mock_lodging.plan_stay"),
     "dining": ("authorized_python_skill", "mock_dining_skill.execute"),
 }
+
+
+def _validate_team_tool_result(result: Any, tool_name: str) -> None:
+    """Reject AgentScope tool errors, which are returned instead of raised."""
+    if not isinstance(result, ToolChunk):
+        raise RuntimeError(f"{tool_name} returned an invalid result")
+    if result.state not in {
+        ToolResultState.RUNNING,
+        ToolResultState.SUCCESS,
+    } or not result.is_last:
+        raise RuntimeError(f"{tool_name} did not complete successfully")
 
 
 def reception_subagent_templates() -> list[SubAgentTemplate]:
@@ -151,10 +164,11 @@ class ReceptionTeamRuntime:
             "agent_id": leader.agent_id,
         }
         if leader.team_id is None:
-            await self._team_create_factory(**kwargs)(
+            team_result = await self._team_create_factory(**kwargs)(
                 name=f"reception-{run_id[:8]}",
                 description="远方客人接待：接站、住宿、餐饮三角色并行协作。",
             )
+            _validate_team_tool_result(team_result, "TeamCreate")
             leader = await self._storage.get_session(owner, "", session_id)
         if leader is None or leader.team_id is None:
             raise RuntimeError("AgentScope TeamCreate did not persist a team")
@@ -167,12 +181,13 @@ class ReceptionTeamRuntime:
         before = await self._storage.get_team(owner, leader.team_id)
         before_ids = {member.agent_id for member in before.data.members} if before else set()
         for agent_type in _AGENT_TYPES:
-            await creator(
+            agent_result = await creator(
                 name=f"{agent_type}-{run_id[:8]}",
                 description=f"{agent_type} reception specialist",
                 prompt=prompt,
                 subagent_type=agent_type,
             )
+            _validate_team_tool_result(agent_result, "AgentCreate")
         team = await self._storage.get_team(owner, leader.team_id)
         if team is None:
             raise RuntimeError("AgentScope team disappeared during worker creation")
