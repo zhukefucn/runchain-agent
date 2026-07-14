@@ -10,16 +10,6 @@ from pathlib import Path
 import httpx
 import pytest
 
-from agentscope.agent import ContextConfig, ReActConfig
-from agentscope.app.storage import (
-    AgentData,
-    AgentRecord,
-    ChatModelConfig,
-    SessionConfig,
-)
-from agentscope.message import TextBlock, UserMsg
-
-from app.agentscope_ext.sqlite_storage import RUNTIME_PLACEHOLDER_CREDENTIAL_ID
 from app.config import Settings
 from app.main import create_root_app
 
@@ -39,12 +29,6 @@ def _event_payloads(body: str) -> list[dict]:
         for line in body.splitlines()
         if line.startswith("data: ")
     ]
-
-
-def _text(response) -> str:
-    return "".join(
-        block.text for block in response.content if isinstance(block, TextBlock)
-    ).strip()
 
 
 async def _exercise(tmp_path: Path) -> None:
@@ -74,77 +58,34 @@ async def _exercise(tmp_path: Path) -> None:
                 "Authorization": f"Bearer {login.json()['access_token']}"
             }
 
-            # Seed native AgentScope records. The mounted ChatService creates
-            # the app-specific RuntimeAgent, which replaces this persisted
-            # placeholder with the genuine Step model.
-            me = await client.get("/api/auth/me", headers=headers)
-            me.raise_for_status()
-            user_id = me.json()["user_id"]
-            agent_id = "real-step-runtime-agent"
-            session_id = "real-step-runtime-session"
-            prompt = "Reply with one short, normal greeting for this smoke test."
-            await app.state.storage.upsert_agent(
-                user_id,
-                AgentRecord(
-                    id=agent_id,
-                    user_id=user_id,
-                    data=AgentData(
-                        name="real_step_runtime_smoke",
-                        system_prompt="Reply directly and briefly. Do not call tools.",
-                        context_config=ContextConfig(),
-                        react_config=ReActConfig(),
-                    ),
-                ),
-            )
-            await app.state.storage.upsert_session(
-                user_id,
-                agent_id,
-                SessionConfig(
-                    name="real-step-runtime-smoke",
-                    workspace_id=app.state.workspace_manager.assign_workspace_id(
-                        user_id=user_id,
-                        agent_id=agent_id,
-                        session_id=session_id,
-                    ),
-                    chat_model_config=ChatModelConfig(
-                        type="openai_credential",
-                        credential_id=RUNTIME_PLACEHOLDER_CREDENTIAL_ID,
-                        model="runtime-placeholder-never-called",
-                        parameters={},
-                    ),
-                ),
-                session_id=session_id,
-            )
             assert (
                 app.state.agentscope_app.state.custom_agent_cls.__name__
                 == "RunChainRuntimeAgent"
             )
             assert type(app.state.model).__name__ == "OpenAIChatModel"
 
-            native_chat = await client.post(
-                "/internal/agentscope/chat/",
+            general_session = await client.post(
+                "/api/manager/sessions",
                 headers=headers,
                 json={
-                    "agent_id": agent_id,
-                    "session_id": session_id,
-                    "input": UserMsg("smoke-user", prompt).model_dump(mode="json"),
+                    "title": "real-model-smoke-general",
+                    "agent_id": "general-assistant",
                 },
             )
-            native_chat.raise_for_status()
-
-            native_reply = ""
-            for _ in range(180):
-                messages = await app.state.storage.list_messages(user_id, session_id)
-                reply_texts = [
-                    text
-                    for message in messages
-                    if (text := _text(message)) and text != prompt
-                ]
-                if reply_texts:
-                    native_reply = reply_texts[-1]
-                    break
-                await asyncio.sleep(0.5)
-            assert native_reply
+            general_session.raise_for_status()
+            general_chat = await client.post(
+                f"/api/manager/sessions/{general_session.json()['id']}/chat",
+                headers=headers,
+                json={"prompt": "Reply with one short greeting for this smoke test."},
+            )
+            general_chat.raise_for_status()
+            general_events = _event_payloads(general_chat.text)
+            assert "".join(
+                str(event["data"].get("text", ""))
+                for event in general_events
+                if event["type"] == "token"
+            ).strip()
+            assert general_events[-1]["type"] == "complete"
 
             # The deterministic expert-team demo is supplementary to the real
             # mounted RuntimeAgent/Step assertion above.

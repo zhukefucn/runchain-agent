@@ -59,6 +59,7 @@ describe("manager workspace", () => {
       if (url.endsWith("/chat")) {
         return sseResponse([
           'data: {"type":"token","request_id":"req-new","session_id":"s-new","run_id":"r-new","data":{"text":"收到"}}\n\n',
+          'data: {"type":"complete","request_id":"req-new","session_id":"s-new","run_id":"r-new","data":{"status":"completed"}}\n\n',
         ]);
       }
       throw new Error(`unexpected ${url}`);
@@ -75,7 +76,9 @@ describe("manager workspace", () => {
     expect(requests[0].body).toEqual({ title: "新对话 1", agent_id: "general-assistant" });
     expect(requests[1].body).toEqual({ prompt: "请安排接待" });
     expect(store.currentId).toBe("s-new");
-    expect(store.assistantText).toBe("收到");
+    expect(store.assistantText).toBe("");
+    expect(store.messages[store.messages.length - 1]?.content).toBe("收到");
+    expect(store.messages.some((message) => message.content.includes("方案执行完成"))).toBe(false);
   });
 
   it("renders operational plan fields without internal owner or AgentScope IDs", () => {

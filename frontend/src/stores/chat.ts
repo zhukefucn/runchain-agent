@@ -30,7 +30,7 @@ function decisionLabel(decision: unknown) {
 
 function eventText(event: StableEvent) {
   if (event.type === "hitl_pending") return "接待方案已汇总，等待你的确认。";
-  if (event.type === "complete") return `${decisionLabel(event.data.decision)}。`;
+  if (event.type === "complete" && "decision" in event.data) return `${decisionLabel(event.data.decision)}。`;
   if (event.type === "error") return `执行异常：${String(event.data.message || "请稍后重试")}`;
   return "";
 }
