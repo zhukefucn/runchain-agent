@@ -43,6 +43,7 @@ class SessionRecordRow(Base):
     owner_user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
+    agent_id: Mapped[str] = mapped_column(String(100))
     title: Mapped[str] = mapped_column(String(200), default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -177,5 +178,7 @@ class AuditRecordRow(Base):
     action: Mapped[str] = mapped_column(String(100), index=True)
     resource_type: Mapped[str] = mapped_column(String(100))
     resource_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    result: Mapped[str] = mapped_column(String(32))
+    request_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
