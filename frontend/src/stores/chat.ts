@@ -4,15 +4,18 @@ import { apiRequest, apiStream } from "@/api/client";
 import { registerStreamCanceller } from "@/api/streams";
 import { parseSseStream, type StableEvent } from "@/api/sse";
 
-export type Session = { id: string; agent_id: string; title: string; status: string; created_at?: string };
+export const GENERAL_AGENT_ID = "general-assistant" as const;
+export const RECEPTION_AGENT_ID = "reception-leader" as const;
+export type AgentMode = typeof GENERAL_AGENT_ID | typeof RECEPTION_AGENT_ID;
+export type Session = { id: string; agent_id: AgentMode; title: string; status: string; created_at?: string };
 export type Message = { id: string; role: string; content: string; ordinal?: number };
 export type Skill = { id: string; name: string; version: string; type: string; description?: string; warnings?: string[] };
 export type WorkspaceFile = { id: string; session_id: string; relative_path: string; created_at?: string };
-type SessionState = { messages: Message[]; events: StableEvent[]; pending?: StableEvent; finalPlan?: unknown; liveText: string; loaded: boolean };
+type SessionState = { messages: Message[]; events: StableEvent[]; pending?: StableEvent; finalPlan?: unknown; liveText: string; loaded: boolean; resultOpen: boolean };
 type HitlUiDecision = "confirm" | "modify" | "cancel";
 type HitlResult = { request_id: string; status: string; events: StableEvent[] };
 
-function blankState(): SessionState { return { messages: [], events: [], liveText: "", loaded: false }; }
+function blankState(): SessionState { return { messages: [], events: [], liveText: "", loaded: false, resultOpen: false }; }
 
 function parseStableEvent(content: string): StableEvent | undefined {
   try {
@@ -38,6 +41,7 @@ export const useChatStore = defineStore("chat", () => {
   const states = reactive<Record<string, SessionState>>({});
   const skills = ref<Skill[]>([]);
   const files = ref<WorkspaceFile[]>([]);
+  const emptyWorkspaceResultOpen = ref(false);
   const streaming = ref(false);
   const error = ref("");
   let activeController: AbortController | undefined;
@@ -50,6 +54,9 @@ export const useChatStore = defineStore("chat", () => {
   const assistantText = computed(() => current.value.liveText);
   const hitl = computed(() => current.value.pending);
   const finalPlan = computed(() => current.value.finalPlan);
+  const resultOpen = computed(() => currentId.value ? current.value.resultOpen : emptyWorkspaceResultOpen.value);
+  const mode = computed<AgentMode>(() => sessions.value.find((session) => session.id === currentId.value)?.agent_id || GENERAL_AGENT_ID);
+  const currentFiles = computed(() => files.value.filter((file) => file.session_id === currentId.value));
 
   function stateFor(id: string) { return states[id] ||= blankState(); }
 
@@ -58,7 +65,10 @@ export const useChatStore = defineStore("chat", () => {
     if (event.type === "token" && typeof event.data.text === "string") state.liveText += event.data.text;
     if (event.type === "hitl_pending") state.pending = event;
     if (event.type === "complete" || event.type === "error") state.pending = undefined;
-    if (event.type === "complete" && "plan" in event.data) state.finalPlan = event.data.plan;
+    if (event.type === "complete" && "plan" in event.data) {
+      state.finalPlan = event.data.plan;
+      state.resultOpen = true;
+    }
     if (transcript && ["hitl_pending", "complete", "error"].includes(event.type)) {
       const streamedText = state.liveText.trim();
       const terminalText = eventText(event);
@@ -107,24 +117,38 @@ export const useChatStore = defineStore("chat", () => {
 
   async function select(id: string) {
     await stopActive();
+    emptyWorkspaceResultOpen.value = false;
     const selectGeneration = generation;
     currentId.value = id;
     const result = await apiRequest<{ items: Message[] }>(`/api/manager/sessions/${encodeURIComponent(id)}/messages`);
     if (generation !== selectGeneration || currentId.value !== id) return;
     reconstruct(result.items, id);
+    if (files.value.some((file) => file.session_id === id)) states[id].resultOpen = true;
   }
 
-  async function create(title: string) {
+  async function create(title: string, agentId: AgentMode = GENERAL_AGENT_ID) {
     await stopActive();
-    const session = await apiRequest<Session>("/api/manager/sessions", { method: "POST", body: JSON.stringify({ title, agent_id: "reception-leader" }) });
+    emptyWorkspaceResultOpen.value = false;
+    const session = await apiRequest<Session>("/api/manager/sessions", { method: "POST", body: JSON.stringify({ title, agent_id: agentId }) });
     sessions.value.unshift(session);
     states[session.id] = { ...blankState(), loaded: true };
     currentId.value = session.id;
   }
 
+  async function createForMode(agentId: AgentMode) {
+    const count = sessions.value.filter((session) => session.agent_id === agentId).length + 1;
+    const title = agentId === RECEPTION_AGENT_ID ? `接待专家团 ${count}` : `新对话 ${count}`;
+    await create(title, agentId);
+  }
+
+  function setResultOpen(open: boolean) {
+    if (currentId.value) stateFor(currentId.value).resultOpen = open;
+    else emptyWorkspaceResultOpen.value = open;
+  }
+
   async function send(prompt: string) {
     await stopActive();
-    if (!currentId.value) await create(`新接待任务 ${sessions.value.length + 1}`);
+    if (!currentId.value) await createForMode(GENERAL_AGENT_ID);
     const sessionId = currentId.value;
     const state = stateFor(sessionId);
     state.messages.push({ id: `local-${Date.now()}`, role: "user", content: prompt });
@@ -169,5 +193,5 @@ export const useChatStore = defineStore("chat", () => {
     return decisionLabel(wireDecision);
   }
 
-  return { sessions, currentId, messages, events, skills, files, streaming, error, assistantText, hitl, finalPlan, load, select, create, send, cancel: stopActive, stopActive, decideHitl };
+  return { sessions, currentId, messages, events, skills, files, currentFiles, streaming, error, assistantText, hitl, finalPlan, resultOpen, mode, load, select, create, createForMode, setResultOpen, send, cancel: stopActive, stopActive, decideHitl };
 });

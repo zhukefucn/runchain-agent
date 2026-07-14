@@ -3,18 +3,58 @@ import { describe, expect, it, vi } from "vitest";
 import ManagerView from "@/views/ManagerView.vue";
 import { parseSseStream } from "@/api/sse";
 import { createTestingApp, jsonResponse, sseResponse } from "./test-app";
-import { useChatStore } from "@/stores/chat";
+import { RECEPTION_AGENT_ID, useChatStore } from "@/stores/chat";
 import FinalPlan from "@/components/FinalPlan.vue";
 
 describe("manager workspace", () => {
-  it("creates the first session automatically when the manager sends from an empty workspace", async () => {
+  it("renders the ordinary Agent workbench with an explicit expert-team entry and result drawer", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/sessions") || url.endsWith("/skills") || url.endsWith("/files")) return jsonResponse({ items: [] });
+      throw new Error(url);
+    }));
+    const { pinia } = createTestingApp({ username: "manager0001", role: "manager", authenticated: true });
+    render(ManagerView, { global: { plugins: [pinia] } });
+
+    expect(await screen.findByRole("heading", { name: "润辰智能助手" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "新建普通对话" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "接待专家团（演示）" })).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole("button", { name: "打开结果" }));
+    expect(screen.getByRole("complementary", { name: "结果展示" })).toHaveClass("result-open");
+    expect(screen.getByRole("button", { name: "业务结果" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "文件" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "执行详情" })).toBeInTheDocument();
+  });
+
+  it("creates expert mode explicitly and keeps result visibility session-scoped", async () => {
+    const bodies: unknown[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      return jsonResponse({ id: `s-${bodies.length}`, title: body.title, status: "active", agent_id: body.agent_id });
+    }));
+    const { pinia } = createTestingApp({ username: "manager0001", role: "manager", authenticated: true });
+    const store = useChatStore(pinia);
+
+    await store.createForMode(RECEPTION_AGENT_ID);
+    store.setResultOpen(true);
+    expect(store.mode).toBe(RECEPTION_AGENT_ID);
+    expect(store.resultOpen).toBe(true);
+    expect(bodies[0]).toEqual({ title: "接待专家团 1", agent_id: "reception-leader" });
+
+    await store.createForMode("general-assistant");
+    expect(store.mode).toBe("general-assistant");
+    expect(store.resultOpen).toBe(false);
+  });
+
+  it("creates the first ordinary-Agent session automatically when the manager sends from an empty workspace", async () => {
     const requests: Array<{ url: string; body?: unknown }> = [];
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
       requests.push({ url, body });
       if (url.endsWith("/api/manager/sessions")) {
-        return jsonResponse({ id: "s-new", title: "新接待任务 1", status: "active", agent_id: "reception-leader" });
+        return jsonResponse({ id: "s-new", title: "新对话 1", status: "active", agent_id: "general-assistant" });
       }
       if (url.endsWith("/chat")) {
         return sseResponse([
@@ -32,7 +72,7 @@ describe("manager workspace", () => {
       "/api/manager/sessions",
       "/api/manager/sessions/s-new/chat",
     ]);
-    expect(requests[0].body).toEqual({ title: "新接待任务 1", agent_id: "reception-leader" });
+    expect(requests[0].body).toEqual({ title: "新对话 1", agent_id: "general-assistant" });
     expect(requests[1].body).toEqual({ prompt: "请安排接待" });
     expect(store.currentId).toBe("s-new");
     expect(store.assistantText).toBe("收到");
@@ -104,9 +144,11 @@ describe("manager workspace", () => {
     render(ManagerView, { global: { plugins: [pinia] } });
 
     expect((await screen.findAllByText("远方专家团接待")).length).toBeGreaterThan(0);
-    await fireEvent.update(screen.getByLabelText("给接待主管发送消息"), "请安排周五晚到站的三位客人");
+    await fireEvent.update(screen.getByLabelText("给接待专家团发送消息"), "请安排周五晚到站的三位客人");
     await fireEvent.click(screen.getByRole("button", { name: /^发送/ }));
     await screen.findByText("正在统筹接待方案。");
+    await fireEvent.click(screen.getByRole("button", { name: "打开结果" }));
+    await fireEvent.click(screen.getByRole("button", { name: "执行详情" }));
     expect(screen.getByText("接站专家")).toBeInTheDocument();
     await fireEvent.click(await screen.findByRole("button", { name: "确认方案" }));
     await waitFor(() => expect(screen.getByText("方案已确认")).toBeInTheDocument());
@@ -116,8 +158,7 @@ describe("manager workspace", () => {
     expect(chat?.body).toEqual({ prompt: "请安排周五晚到站的三位客人" });
     expect(chat?.headers.get("Authorization")).toBe("Bearer test-token");
     expect(JSON.stringify(requests)).not.toMatch(/owner_user_id|user_id|\"role\"/);
-    await fireEvent.click(screen.getByRole("button", { name: "执行详情" }));
-    expect(screen.getByRole("complementary", { name: "执行详情" })).toHaveClass("mobile-open");
+    expect(screen.getByRole("complementary", { name: "结果展示" })).toHaveClass("result-open");
   });
 
   it("reconstructs a persisted pending HITL event and human transcript", async () => {

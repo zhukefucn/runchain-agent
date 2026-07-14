@@ -71,11 +71,11 @@ async function runReception(page: Page, username: string, sharedSkillName: strin
       (response) => response.url().endsWith("/api/manager/sessions")
         && response.request().method() === "POST",
     ),
-    page.getByTitle("新建会话").click(),
+    page.getByRole("button", { name: "接待专家团（演示）" }).click(),
   ]);
   expect(created.status()).toBe(201);
   const sessionId = (await created.json() as { id: string }).id;
-  await page.getByLabel("给接待主管发送消息").fill(
+  await page.getByLabel("给接待专家团发送消息").fill(
     "接待 4 位远方客人，明天 18:00 到南京南站，安排接站、住宿和清淡餐饮。",
   );
   const [chatResponse] = await Promise.all([
@@ -91,8 +91,11 @@ async function runReception(page: Page, username: string, sharedSkillName: strin
   await expect(page.locator(".agent-roster")).toContainText("接站");
   await expect(page.locator(".agent-roster")).toContainText("住宿");
   await expect(page.locator(".agent-roster")).toContainText("餐饮");
+  await page.getByRole("button", { name: "打开结果" }).click();
+  await page.getByRole("button", { name: "执行详情" }).click();
   await expect(page.locator(".timeline")).toContainText("调用工具");
   await page.getByRole("button", { name: "确认方案" }).click();
+  await page.getByRole("button", { name: "业务结果" }).click();
   await expect(page.getByLabel("最终接待方案")).toBeVisible();
   const publicSessions = await api<{ items: Array<{ title: string }> }>(
     page,
@@ -184,7 +187,7 @@ test("approved 11-step multi-tenant browser demonstration", async ({ browser }) 
   const run1 = await runReception(run1Page, "manager0001", skillName);
   expect(run1.principal.user_id).toBe(manager1.user_id);
   await expect(run1Page.getByText(skillName, { exact: true })).toHaveCount(0);
-  await run1Page.getByRole("button", { name: "资源" }).click();
+  await run1Page.getByRole("button", { name: "文件" }).click();
   await expect(run1Page.getByText(skillName, { exact: true })).toBeVisible();
   const manager1Skills = await api<{ items: Array<{ id: string; name: string }> }>(run1Page, "/api/manager/skills");
   const privateSkillId = manager1Skills.items.find((skill) => skill.name === privateSkillName)!.id;
@@ -215,7 +218,7 @@ test("approved 11-step multi-tenant browser demonstration", async ({ browser }) 
   );
   expect(manager2Skills.items.some((skill) => skill.name === skillName)).toBe(true);
   expect(manager2Skills.items.some((skill) => skill.name === privateSkillName)).toBe(false);
-  await run2Page.getByRole("button", { name: "资源" }).click();
+  await run2Page.getByRole("button", { name: "文件" }).click();
   await expect(run2Page.getByText(skillName, { exact: true })).toBeVisible();
   await expect(run2Page.getByText(privateSkillName, { exact: true })).toHaveCount(0);
   await run2Page.goto("/system");
