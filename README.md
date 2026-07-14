@@ -17,7 +17,7 @@ Phase 1 是通用技术底座，不是银行尽调或报告系统。接待专家
 
 ## Windows 快速启动
 
-前置条件：Windows PowerShell、Python 3.11–3.13、Node.js、pnpm，以及位于本项目同级目录的 `agentscope-main` 源码。Windows 版本不需要、也不使用 Docker Desktop。
+前置条件：Windows PowerShell、Python 3.11–3.13、Node.js、pnpm，以及位于本项目同级目录的 `agentscope-main` 源码。Windows 版本不需要、也不使用 Docker Desktop。Phase 1 当前锁定 AgentScope `2.0.4`；`agentscope-source.lock.json` 记录完整 `src/agentscope` 源码树摘要，`setup.ps1` 和 `check-env.ps1` 会在使用 editable dependency 前验证，且不会修改上游目录。
 
 在本目录执行：
 

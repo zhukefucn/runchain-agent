@@ -110,7 +110,7 @@ MCP 配置由 business_admin 创建。Phase 1 只接受 allowlist 中的本机 P
 
 根应用 lifespan 顺序初始化目录安全检查、数据库 Schema/种子、Skill/Runner/MCP 服务、模型与 AgentScope 子应用。关闭时以不可中断清理保证 MCP Registry 先进入终止态，再关闭 Skill 数据库会话并 dispose SQLAlchemy engine。
 
-`/api/health` 表示进程存活；`/api/ready` 汇总数据库、Workspace、AgentScope 导入、Runner 能力和非敏感模型配置状态。真实模型的外部连通性是单独状态，不让离线 Fake Model 测试依赖外网。
+`/api/health` 表示进程存活；`/api/ready` 汇总数据库、Workspace、AgentScope 导入、Runner 能力和非敏感模型配置状态。数据库检查验证必需表、Alembic head，并在两秒边界内执行只回滚的 SQLite 写入探针。真实模型的外部连通性是单独状态，不让离线 Fake Model 测试依赖外网。
 
 ## 8. Phase 2 替换边界
 

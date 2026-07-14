@@ -54,6 +54,17 @@ else {
     Write-Host "[OK] $pythonVersion"
 }
 
+$venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
+if (Test-Path $venvPython) {
+    & $venvPython (Join-Path $PSScriptRoot "verify_agentscope_source.py")
+    if ($LASTEXITCODE -ne 0) {
+        Add-Failure "Local AgentScope source does not match agentscope-source.lock.json."
+    }
+}
+else {
+    Add-Failure "Python environment is missing. Run scripts\setup.ps1 first."
+}
+
 try {
     $nodeVersion = (& node --version 2>&1 | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) {

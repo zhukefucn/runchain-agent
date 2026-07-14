@@ -2,7 +2,7 @@
 
 ## 1. 适配原则
 
-本项目不 fork AgentScope，也不把 QwenPaw 改造成多租户应用。AgentScope 源码以同级目录 `agentscope-main` 的 editable dependency 使用；RunChain 通过正式扩展点和少量边界适配完成鉴权、存储、Workspace、动态 Tool 与稳定前端 API。
+本项目不 fork AgentScope，也不把 QwenPaw 改造成多租户应用。AgentScope 源码以同级目录 `agentscope-main` 的 editable dependency 使用；RunChain 通过正式扩展点和少量边界适配完成鉴权、存储、Workspace、动态 Tool 与稳定前端 API。当前源码包没有 Git 元数据，因此 `agentscope-source.lock.json` 以发布版本 `2.0.4` 加完整源码树 SHA-256 代替不可验证的 commit 声明；安装和环境检查都会验证该锁，且不会改写上游 AgentScope 树。
 
 QwenPaw 仅用于参考 `SKILL.md`、有效 Skill 解析、Agent 构建和治理交互思想，不作为运行时依赖。
 

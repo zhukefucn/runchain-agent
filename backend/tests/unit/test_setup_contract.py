@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 
@@ -83,3 +84,21 @@ def test_mcp_sdk_is_a_direct_exact_runtime_dependency():
     lock_lines = (PROJECT_ROOT / "requirements.lock").read_text().splitlines()
     assert '"mcp==1.28.1"' in pyproject
     assert "mcp==1.28.1" in lock_lines
+
+
+def test_local_agentscope_source_is_reproducibly_locked_and_validated():
+    lock = json.loads(
+        (PROJECT_ROOT / "agentscope-source.lock.json").read_text(encoding="utf-8")
+    )
+    assert lock == {
+        "version": "2.0.4",
+        "source_tree_sha256": lock["source_tree_sha256"],
+    }
+    assert len(lock["source_tree_sha256"]) == 64
+    assert set(lock["source_tree_sha256"]) <= set("0123456789abcdef")
+
+    verifier = PROJECT_ROOT / "scripts" / "verify_agentscope_source.py"
+    assert verifier.is_file()
+    for script_name in ("setup.ps1", "check-env.ps1"):
+        source = (PROJECT_ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+        assert "verify_agentscope_source.py" in source

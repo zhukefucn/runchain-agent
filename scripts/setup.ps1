@@ -59,6 +59,12 @@ if (-not (Test-Path $venvPython)) {
     }
 }
 
+Write-Host "Verifying the pinned local AgentScope source"
+& $venvPython (Join-Path $PSScriptRoot "verify_agentscope_source.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "Local AgentScope source validation failed."
+}
+
 Write-Host "Installing locked dependencies"
 & $venvPython -m pip install --disable-pip-version-check --requirement $lockPath
 if ($LASTEXITCODE -ne 0) {

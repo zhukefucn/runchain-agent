@@ -277,16 +277,26 @@ class McpRuntimeRegistry:
         )
         while self._notifications:
             await asyncio.gather(*tuple(self._notifications), return_exceptions=True)
-        async with self.session_factory() as db:
-            await db.execute(
-                update(McpServerRow)
-                .where(McpServerRow.status == "running")
-                .values(status="stopped", last_error=None)
+        try:
+            async with self.session_factory() as db:
+                await db.execute(
+                    update(McpServerRow)
+                    .where(McpServerRow.status == "running")
+                    .values(status="stopped", last_error=None)
+                )
+                await db.commit()
+        except Exception:
+            # Process ownership must become terminal even when startup failed
+            # before the schema existed (or the database is unavailable during
+            # shutdown). A later startup reconciliation handles stale rows.
+            logger.warning(
+                "Failed to reconcile persisted MCP state during shutdown",
+                exc_info=True,
             )
-            await db.commit()
-        async with self._global_lock:
-            self.closed = True
-            self.closing = False
+        finally:
+            async with self._global_lock:
+                self.closed = True
+                self.closing = False
 
     async def aclose(self) -> None:
         await self.shutdown_all()

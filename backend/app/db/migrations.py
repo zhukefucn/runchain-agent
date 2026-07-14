@@ -7,6 +7,9 @@ from alembic.config import Config
 from sqlalchemy.engine import make_url
 
 
+ALEMBIC_HEAD_REVISION = "20260714_02"
+
+
 def _sync_url(database_url: str) -> str:
     url = make_url(database_url)
     if url.drivername == "sqlite+aiosqlite":
@@ -37,4 +40,8 @@ def downgrade_database_url(database_url: str) -> None:
     command.downgrade(_config(database_url), "base")
 
 
-__all__ = ["downgrade_database_url", "upgrade_database_url"]
+__all__ = [
+    "ALEMBIC_HEAD_REVISION",
+    "downgrade_database_url",
+    "upgrade_database_url",
+]

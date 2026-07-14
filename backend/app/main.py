@@ -145,7 +145,7 @@ class _IdentitySanitizerMiddleware:
         await self.app(scope, receive, send)
 
 
-async def _await_uncancellable(awaitable) -> None:
+async def _await_uncancellable(awaitable):
     """Finish cleanup despite repeated cancellation, then propagate it."""
     cleanup_task = asyncio.create_task(awaitable)
     cancelled = False
@@ -154,9 +154,10 @@ async def _await_uncancellable(awaitable) -> None:
             await asyncio.shield(cleanup_task)
         except asyncio.CancelledError:
             cancelled = True
-    cleanup_task.result()
+    result = cleanup_task.result()
     if cancelled:
         raise asyncio.CancelledError
+    return result
 
 
 def create_root_app(
@@ -312,6 +313,7 @@ def create_root_app(
                 await close_resource("skill database", skill_db.close)
             await close_resource("database engine", engine.dispose)
 
+        agentscope_lifespan = None
         try:
             settings.workspace_root.mkdir(parents=True, exist_ok=True)
             settings.skill_root.mkdir(parents=True, exist_ok=True)
@@ -370,10 +372,35 @@ def create_root_app(
             app.state.model_configured = model_runtime.configured
             runtime["model"] = model_runtime.model
 
-            async with agentscope_app.router.lifespan_context(agentscope_app):
-                yield
-        finally:
+            agentscope_lifespan = agentscope_app.router.lifespan_context(
+                agentscope_app
+            )
+            await agentscope_lifespan.__aenter__()
+        except BaseException:
             await _await_uncancellable(cleanup())
+            raise
+
+        async def shutdown(exc_type=None, exc=None, traceback=None):
+            # The mounted runtime owns resources that can still use the root
+            # database.  Its whole exit therefore runs before root teardown,
+            # in the same cancellation-resistant transaction.
+            try:
+                return await agentscope_lifespan.__aexit__(
+                    exc_type, exc, traceback
+                )
+            finally:
+                await cleanup()
+
+        try:
+            yield
+        except BaseException as exc:
+            suppressed = await _await_uncancellable(
+                shutdown(type(exc), exc, exc.__traceback__)
+            )
+            if not suppressed:
+                raise
+        else:
+            await _await_uncancellable(shutdown())
 
     app = FastAPI(title="RunChain Multi-tenant Agent", lifespan=lifespan)
     app.state.settings = settings

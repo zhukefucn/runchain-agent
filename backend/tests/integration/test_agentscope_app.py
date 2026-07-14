@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from agentscope.agent import Agent
@@ -309,6 +309,9 @@ def test_root_app_liveness_readiness_identity_bridge_and_clean_lifespan(tmp_path
         ready = await client.get("/api/ready")
         assert ready.status_code == 200
         assert ready.json()["status"] == "ready"
+        assert ready.json()["components"]["database"]["detail"] == (
+            "schema, migration head, and rollback-only write verified"
+        )
         assert all("\\" not in json.dumps(item) for item in ready.json()["components"].values())
 
         login = await client.post(
@@ -498,6 +501,23 @@ def test_root_app_liveness_readiness_identity_bridge_and_clean_lifespan(tmp_path
         assert failed.status_code == 503
         assert failed.json()["components"]["runner_capability"]["status"] == "failed"
 
+        # Readiness is schema-aware and its write probe never leaves a row.
+        app.state.runner_capabilities_verified = True
+        async with app.state.session_factory() as db:
+            before = await db.scalar(select(func.count()).select_from(User))
+        assert (await client.get("/api/ready")).status_code == 200
+        async with app.state.session_factory() as db:
+            after = await db.scalar(select(func.count()).select_from(User))
+            await db.execute(text("DELETE FROM alembic_version"))
+            await db.commit()
+        assert before == after
+        stale_schema = await client.get("/api/ready")
+        assert stale_schema.status_code == 503
+        assert stale_schema.json()["components"]["database"] == {
+            "status": "failed",
+            "detail": "schema verification failed",
+        }
+
     asyncio.run(scenario())
 
 
@@ -580,5 +600,63 @@ def test_uncancellable_cleanup_finishes_after_repeated_cancellation():
             await task
         assert finished.is_set()
         assert events == ["registry-terminal", "engine-disposed"]
+
+    asyncio.run(scenario())
+
+
+def test_root_lifespan_keeps_agentscope_exit_and_root_cleanup_uncancellable(
+    monkeypatch, tmp_path
+):
+    """AgentScope resources close before root resources despite repeated cancel."""
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI
+
+    from app.main import create_root_app
+
+    async def scenario():
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+        events: list[str] = []
+
+        @asynccontextmanager
+        async def fake_agentscope_lifespan(_app):
+            try:
+                yield
+            finally:
+                close_started.set()
+                await allow_close.wait()
+                events.append("agentscope-closed")
+
+        agentscope_app = FastAPI(lifespan=fake_agentscope_lifespan)
+        app = create_root_app(
+            _settings(tmp_path), overrides={"agentscope_app": agentscope_app}
+        )
+        engine_type = type(app.state.engine)
+        original_dispose = engine_type.dispose
+
+        async def recording_dispose(engine):
+            events.append("engine-disposed")
+            await original_dispose(engine)
+
+        monkeypatch.setattr(engine_type, "dispose", recording_dispose)
+
+        async def run_lifespan():
+            async with app.router.lifespan_context(app):
+                pass
+
+        task = asyncio.create_task(run_lifespan())
+        await close_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not app.state.mcp_registry.closed
+        allow_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert app.state.mcp_registry.closed
+        assert events == ["agentscope-closed", "engine-disposed"]
 
     asyncio.run(scenario())
