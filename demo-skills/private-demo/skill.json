@@ -1,0 +1,15 @@
+{
+  "id": "private-demo",
+  "name": "private-demo",
+  "version": "1.0.0",
+  "type": "python",
+  "entrypoint": "scripts/main.py",
+  "description": "Deterministic mock response used for authorization demonstrations.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "message": {"type": "string", "maxLength": 200}
+    },
+    "additionalProperties": false
+  }
+}

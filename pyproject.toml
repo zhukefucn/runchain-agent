@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentscope-multitenant-demo"
+version = "0.1.0"
+description = "Windows-native multi-tenant AgentScope demo"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "alembic==1.18.5",
+    "SQLAlchemy==2.0.44",
+    "aiosqlite==0.21.0",
+    "argon2-cffi==25.1.0",
+    "fastapi==0.139.0",
+    "PyJWT==2.13.0",
+    "jsonschema==4.26.0",
+    "mcp==1.28.1",
+    "pydantic-settings==2.10.1",
+    "APScheduler==3.11.3",
+    "ag-ui-protocol==0.1.19",
+    "uvicorn==0.51.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx==0.28.1",
+    "pytest==8.4.2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["backend/tests"]
+markers = [
+    "real_model: calls the configured external model provider (opt-in)",
+]
+
+[tool.setuptools.packages.find]
+where = ["backend"]

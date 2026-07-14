@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+data/
+workspace/
+skills/
+.runner/
+.run/
+node_modules/
+dist/
+frontend/test-results/
+frontend/playwright-report/
+.vite-*.log
+*.tsbuildinfo
