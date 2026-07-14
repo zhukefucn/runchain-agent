@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import aclosing
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.hitl import HitlConflict, HitlNotFound
+from app.agents.general import GENERAL_AGENT_ID, RECEPTION_AGENT_ID
 from app.agents.sse import StableEvent, encode_sse
 from app.auth.deps import get_session, require_role
 from app.auth.models import Principal
@@ -29,7 +30,7 @@ class SessionCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str = Field(default="", max_length=200)
-    agent_id: str = Field(default="reception-leader", min_length=1, max_length=100)
+    agent_id: Literal["general-assistant", "reception-leader"] = GENERAL_AGENT_ID
 
 
 class ChatRequest(BaseModel):
@@ -144,7 +145,8 @@ async def list_messages(
     db: AsyncSession = Depends(get_session),
 ):
     repository = _manager_repository(request, db)
-    if await repository.get_session(principal.user_id, session_id) is None:
+    session = await repository.get_session(principal.user_id, session_id)
+    if session is None:
         await _audit(
             request,
             principal,
@@ -169,7 +171,8 @@ async def chat(
     db: AsyncSession = Depends(get_session),
 ):
     repository = _manager_repository(request, db)
-    if await repository.get_session(principal.user_id, session_id) is None:
+    session = await repository.get_session(principal.user_id, session_id)
+    if session is None:
         await _audit(
             request,
             principal,
@@ -181,7 +184,7 @@ async def chat(
             status_code=404,
         )
         raise ApiError(404, "NOT_FOUND", "资源不存在")
-    if (
+    if session.agent_id == RECEPTION_AGENT_ID and (
         await repository.create_message(
             principal.user_id, session_id, role="user", content=payload.prompt
         )
@@ -205,7 +208,12 @@ async def chat(
 
     async def stream():
         run_id = "unavailable"
-        nested = request.app.state.reception_runtime.chat(
+        runtime = (
+            request.app.state.general_runtime
+            if session.agent_id == GENERAL_AGENT_ID
+            else request.app.state.reception_runtime
+        )
+        nested = runtime.chat(
             principal.user_id,
             session_id,
             payload.prompt,

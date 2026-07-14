@@ -74,6 +74,100 @@ def _skill_zip() -> bytes:
     return output.getvalue()
 
 
+def test_manager_agent_modes_are_allowlisted_and_dispatched_from_the_session(tmp_path):
+    class RecordingRuntime:
+        def __init__(self, label: str):
+            self.label = label
+            self.calls: list[tuple[str, str]] = []
+
+        async def chat(self, _owner, session_id, prompt, *, request_id):
+            self.calls.append((session_id, prompt))
+            yield StableEvent(
+                type="complete",
+                request_id=request_id,
+                session_id=session_id,
+                run_id=f"run-{self.label}",
+                data={"mode": self.label},
+            )
+
+    async def scenario():
+        async with _client(tmp_path) as (client, app):
+            general = RecordingRuntime("general")
+            reception = RecordingRuntime("reception")
+            app.state.general_runtime = general
+            app.state.reception_runtime = reception
+            headers = await _auth(client, "manager0001")
+
+            default_session = await client.post(
+                "/api/manager/sessions",
+                headers=headers,
+                json={"title": "ordinary"},
+            )
+            assert default_session.status_code == 201
+            assert default_session.json()["agent_id"] == "general-assistant"
+
+            expert_session = await client.post(
+                "/api/manager/sessions",
+                headers=headers,
+                json={"title": "expert", "agent_id": "reception-leader"},
+            )
+            assert expert_session.status_code == 201
+
+            rejected = await client.post(
+                "/api/manager/sessions",
+                headers=headers,
+                json={"title": "unknown", "agent_id": "untrusted-agent"},
+            )
+            assert rejected.status_code == 422
+
+            ordinary_chat = await client.post(
+                f"/api/manager/sessions/{default_session.json()['id']}/chat",
+                headers=headers,
+                json={"prompt": "hello ordinary agent"},
+            )
+            expert_chat = await client.post(
+                f"/api/manager/sessions/{expert_session.json()['id']}/chat",
+                headers=headers,
+                json={"prompt": "hello expert team"},
+            )
+            assert ordinary_chat.status_code == expert_chat.status_code == 200
+            assert len(general.calls) == len(reception.calls) == 1
+            assert general.calls[0][1] == "hello ordinary agent"
+            assert reception.calls[0][1] == "hello expert team"
+
+    asyncio.run(scenario())
+
+
+def test_general_manager_session_runs_the_mounted_agentscope_agent(tmp_path):
+    async def scenario():
+        async with _client(tmp_path) as (client, _app):
+            headers = await _auth(client, "manager0001")
+            created = await client.post(
+                "/api/manager/sessions",
+                headers=headers,
+                json={"title": "ordinary agent"},
+            )
+            response = await client.post(
+                f"/api/manager/sessions/{created.json()['id']}/chat",
+                headers=headers,
+                json={"prompt": "hello general runtime"},
+            )
+            assert response.status_code == 200
+            assert "fake: hello general runtime" in response.text
+            assert '"mode":"general"' in response.text
+
+            transcript = await client.get(
+                f"/api/manager/sessions/{created.json()['id']}/messages",
+                headers=headers,
+            )
+            assert transcript.status_code == 200
+            contents = [item["content"] for item in transcript.json()["items"]]
+            assert contents.count("hello general runtime") == 1
+            assert "fake: hello general runtime" in contents
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("path", "allowed", "forbidden"),
     [

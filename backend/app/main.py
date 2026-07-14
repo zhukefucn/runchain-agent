@@ -27,6 +27,7 @@ from app.agents.factory import (
     build_runtime_agent_class,
 )
 from app.agents.hitl import HitlService
+from app.agents.general import GeneralAgentRuntime
 from app.agents.reception import (
     AgentScopeSubagentExecutor,
     ReceptionTeamRuntime,
@@ -427,6 +428,10 @@ def create_root_app(
     app.state.model_configured = False
     app.state.password_hasher = supplied.get("password_hasher") or PasswordHasher()
     app.state.custom_subagent_templates = list(templates)
+    app.state.general_runtime = GeneralAgentRuntime(
+        storage,
+        chat_service_provider=lambda: agentscope_app.state.chat_service,
+    )
     app.state.reception_runtime = ReceptionTeamRuntime(
         sessions,
         templates=list(templates),
