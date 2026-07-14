@@ -40,7 +40,11 @@ def SkillService(db, install_root):
     )
 
 
-def package(version: str = "1.0.0", name: str = "private-demo") -> bytes:
+def package(
+    version: str = "1.0.0",
+    name: str = "private-demo",
+    main_source: str = "print('ok')",
+) -> bytes:
     output = io.BytesIO()
     manifest = {
         "id": name, "name": name, "version": version, "type": "python",
@@ -49,7 +53,7 @@ def package(version: str = "1.0.0", name: str = "private-demo") -> bytes:
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(f"{name}/SKILL.md", "# demo")
         archive.writestr(f"{name}/skill.json", json.dumps(manifest))
-        archive.writestr(f"{name}/main.py", "print('ok')")
+        archive.writestr(f"{name}/main.py", main_source)
     return output.getvalue()
 
 
@@ -243,8 +247,12 @@ def test_versions_are_distinct_duplicate_is_idempotent_and_publish_switches_acti
         upload_one = package("1.0.0")
         one = await service.install(admin, upload_one)
         assert (await service.install(admin, upload_one)).id == one.id
+        assert (await service.install(admin, upload_one + b"different")).id == one.id
         with pytest.raises(SkillConflictError):
-            await service.install(admin, upload_one + b"different")
+            await service.install(
+                admin,
+                package("1.0.0", main_source="print('changed')"),
+            )
         two = await service.install(admin, package("2.0.0"))
         await service.publish(admin, one.id)
         await service.authorize(admin, one.id, users["manager0001"].id)
