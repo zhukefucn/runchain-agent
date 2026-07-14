@@ -703,6 +703,9 @@ def test_business_mcp_endpoints_are_local_metadata_and_delegate_test(tmp_path):
             self.calls.append(("tools", actor, server_id))
             return [{"name": "pickup", "description": "mock", "input_schema": {}}]
 
+        async def stop(self, actor, server_id, request_id=None):
+            self.calls.append(("stop", actor, server_id, request_id))
+
     async def scenario():
         async with _client(tmp_path) as (client, app):
             fake = FakeMcpService()
@@ -730,11 +733,17 @@ def test_business_mcp_endpoints_are_local_metadata_and_delegate_test(tmp_path):
                     {"name": "pickup", "description": "mock", "input_schema": {}}
                 ],
             }
+            stopped = await client.post(
+                "/api/business/mcp-servers/mcp-1/stop", headers=headers
+            )
+            assert stopped.status_code == 200
+            assert stopped.json() == {"server_id": "mcp-1", "status": "stopped"}
             assert [call[0] for call in fake.calls] == [
                 "register",
                 "start",
                 "health",
                 "tools",
+                "stop",
             ]
 
     asyncio.run(scenario())

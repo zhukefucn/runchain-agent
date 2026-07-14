@@ -699,6 +699,57 @@ def test_registry_close_takes_over_reserved_runtime_and_waits_cleanup(tmp_path):
     asyncio.run(_fault_scenario(tmp_path, check, call_timeout=2))
 
 
+def test_repeated_cancel_during_failed_start_finishes_retirement_and_audit(
+    tmp_path, monkeypatch
+):
+    async def check(service, registry, users, db):
+        import app.mcp.service as mcp_module
+
+        server = await _register_fault(service, users)
+        runtime_started = asyncio.Event()
+        cleanup_entered = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_stop = mcp_module._stop_runtime_process
+
+        async def blocked_protocol(runtime):
+            runtime_started.set()
+            await runtime.stop_requested.wait()
+
+        async def blocked_stop(runtime):
+            cleanup_entered.set()
+            await release_cleanup.wait()
+            await original_stop(runtime)
+
+        monkeypatch.setattr(mcp_module._Runtime, "run_protocol", blocked_protocol)
+        monkeypatch.setattr(mcp_module, "_stop_runtime_process", blocked_stop)
+        start = asyncio.create_task(
+            service.start(_principal(users["business_admin01"]), server.id)
+        )
+        await runtime_started.wait()
+        runtime = await registry.current(server.id)
+        assert runtime is not None
+
+        start.cancel()
+        await cleanup_entered.wait()
+        start.cancel()
+        release_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await start
+
+        assert await registry.current(server.id) is None
+        assert runtime.task is not None and runtime.task.done()
+        audits = list(
+            await db.scalars(
+                select(AuditRecordRow).where(AuditRecordRow.action == "mcp.start")
+            )
+        )
+        assert len(audits) == 1
+        assert audits[0].result == "failure"
+        assert audits[0].details == {"operation": "connect", "status": "failure"}
+
+    asyncio.run(_fault_scenario(tmp_path, check, call_timeout=2))
+
+
 def test_cancel_while_waiting_call_slot_does_not_retire_shared_runtime(tmp_path):
     async def check(service, registry, users, db):
         admin = _principal(users["business_admin01"])

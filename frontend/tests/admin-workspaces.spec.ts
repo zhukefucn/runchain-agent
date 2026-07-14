@@ -53,6 +53,7 @@ it("business admin shows tools returned by an MCP connectivity test", async () =
     if (url.endsWith("/skills") || url.endsWith("/skill-invocations")) return jsonResponse({ items: [] });
     if (url.endsWith("/mcp-servers")) return jsonResponse({ items: [{ id: "m1", name: "接站规划", transport: "stdio", status: "stopped" }] });
     if (url.endsWith("/mcp-servers/m1/test")) return jsonResponse({ server_id: "m1", healthy: true, tools: [{ name: "plan_pickup", description: "规划接站" }] });
+    if (url.endsWith("/mcp-servers/m1/stop")) return jsonResponse({ server_id: "m1", status: "stopped" });
     if (url.endsWith("/mcp-servers/m1/authorizations")) return jsonResponse({ id: "a1", server_id: "m1", user_id: "manager-id" });
     throw new Error(url);
   });
@@ -62,6 +63,12 @@ it("business admin shows tools returned by an MCP connectivity test", async () =
   await fireEvent.click(screen.getByRole("button", { name: /MCP Server/ }));
   await fireEvent.click(await screen.findByRole("button", { name: "测试连接" }));
   expect(await screen.findByText("plan_pickup")).toBeInTheDocument();
+  await fireEvent.click(screen.getByRole("button", { name: "停止" }));
+  expect(fetchMock).toHaveBeenCalledWith(
+    "/api/business/mcp-servers/m1/stop",
+    expect.objectContaining({ method: "POST" }),
+  );
+  expect(await screen.findByText(/stdio · stopped/)).toBeInTheDocument();
   await fireEvent.update(screen.getByLabelText("授权 接站规划 MCP 给经理"), "manager-id");
   await fireEvent.click(screen.getByRole("button", { name: "授权" }));
   expect(fetchMock).toHaveBeenCalledWith(

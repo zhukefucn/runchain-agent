@@ -102,7 +102,7 @@ business_admin 只能从浏览器上传本机 ZIP。Skill 包必须含单一根�
 
 Python Skill 在独立子进程中以结构化 JSON 输入/输出执行，受超时、输出、内存、进程数、并发数和 Windows Job Object 控制。它是可信代码 Runner，不是恶意代码沙箱。
 
-MCP 配置由 business_admin 创建。Phase 1 只接受 allowlist 中的本机 Python Server、规范化 Python 可执行文件和空环境配置；模型密钥不会传给 MCP。Runtime Registry 管理启动、健康、Tool 发现、调用和退出清理。
+MCP 配置由 business_admin 创建。Phase 1 只接受 allowlist 中的本机 Python Server、规范化 Python 可执行文件和空环境配置；模型密钥不会传给 MCP。Runtime Registry 管理启动、健康、Tool 发现、调用、显式停止和退出清理；应用启动与正常关闭都会把没有对应内存 Runtime 的持久化 `running` 状态收敛为 `stopped`。
 
 接待专家团在每次对话时按当前 manager/session 动态选择上述受控能力：有可用授权时走真实 Skill Runner 和 MCP `CallTool`，否则才使用结构相同的确定性 Mock 回退，确保全新环境也能演示编排。HTTP 对话的 `request_id` 会贯穿专家团 runtime，并写入 Skill 与 MCP 调用审计，便于端到端关联一次演示请求。
 

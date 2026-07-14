@@ -13,7 +13,7 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator, FormatChecker
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -48,6 +48,21 @@ class McpConflictError(McpError):
 
 class McpUnavailableError(McpError):
     pass
+
+
+async def _await_uncancellable(awaitable):
+    """Finish a cleanup transaction despite repeated cancellation."""
+    task = asyncio.create_task(awaitable)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 def _sha256(path: Path) -> str:
@@ -231,13 +246,16 @@ class McpRuntimeRegistry:
             del self.runtimes[runtime.key]
             return True
 
-    async def retire(self, runtime: _Runtime) -> bool:
+    async def _retire_impl(self, runtime: _Runtime) -> bool:
         removed = await self.compare_remove(runtime)
         if not removed:
             return False
         runtime.intentional_stop = True
         await _stop_runtime_process(runtime)
         return True
+
+    async def retire(self, runtime: _Runtime) -> bool:
+        return await _await_uncancellable(self._retire_impl(runtime))
 
     async def shutdown_all(self) -> None:
         async with self._global_lock:
@@ -259,6 +277,13 @@ class McpRuntimeRegistry:
         )
         while self._notifications:
             await asyncio.gather(*tuple(self._notifications), return_exceptions=True)
+        async with self.session_factory() as db:
+            await db.execute(
+                update(McpServerRow)
+                .where(McpServerRow.status == "running")
+                .values(status="stopped", last_error=None)
+            )
+            await db.commit()
         async with self._global_lock:
             self.closed = True
             self.closing = False
@@ -568,17 +593,20 @@ class McpService:
                 if runtime.failure is not None or runtime.session is None:
                     raise McpUnavailableError("MCP server failed to initialize")
             except BaseException:
-                await self._registry.retire(runtime)
-                await self._record_state_audit(
-                    actor=actor,
-                    server_id=server_id,
-                    status="failed",
-                    error_code="START_FAILED",
-                    action="mcp.start",
-                    result="failure",
-                    details={"operation": "connect", "status": "failure"},
-                    request_id=request_id,
-                )
+                async def retire_and_record_failure() -> None:
+                    await self._registry.retire(runtime)
+                    await self._record_state_audit(
+                        actor=actor,
+                        server_id=server_id,
+                        status="failed",
+                        error_code="START_FAILED",
+                        action="mcp.start",
+                        result="failure",
+                        details={"operation": "connect", "status": "failure"},
+                        request_id=request_id,
+                    )
+
+                await _await_uncancellable(retire_and_record_failure())
                 raise
             await self._record_state_audit(
                 actor=actor,
@@ -621,7 +649,9 @@ class McpService:
     async def _stop_runtime(self, runtime: _Runtime) -> None:
         await self._registry.retire(runtime)
 
-    async def stop(self, actor: Principal, server_id: str) -> None:
+    async def stop(
+        self, actor: Principal, server_id: str, request_id: str | None = None
+    ) -> None:
         self._require_admin(actor)
         async with self._lock(server_id):
             async with self._sessions() as db:
@@ -637,6 +667,7 @@ class McpService:
                 action="mcp.stop",
                 result="success",
                 details={"operation": "disconnect", "transport": "stdio"},
+                request_id=request_id,
             )
 
     async def health(

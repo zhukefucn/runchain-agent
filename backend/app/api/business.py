@@ -381,6 +381,31 @@ async def test_mcp_server(
     return {"server_id": server_id, "healthy": healthy, "tools": tools}
 
 
+@router.post("/mcp-servers/{server_id}/stop")
+async def stop_mcp_server(
+    server_id: str,
+    request: Request,
+    principal: BusinessPrincipal,
+):
+    try:
+        await request.app.state.mcp_service.stop(
+            principal, server_id, request_id=request.state.request_id
+        )
+    except Exception as error:
+        api_error = _mcp_error(error)
+        await _audit_failure_once(
+            request,
+            principal,
+            "mcp.stop",
+            "mcp_server",
+            server_id,
+            "disconnect",
+            api_error.status_code,
+        )
+        raise api_error from error
+    return {"server_id": server_id, "status": "stopped"}
+
+
 @router.post("/mcp-servers/{server_id}/authorizations")
 async def authorize_mcp_server(
     server_id: str,

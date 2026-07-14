@@ -1,8 +1,8 @@
 from argon2 import PasswordHasher
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Role, User
+from app.db.models import McpServerRow, Role, User
 
 
 DEMO_USERS = {
@@ -16,6 +16,11 @@ _password_hasher = PasswordHasher()
 
 
 async def seed_demo_data(session: AsyncSession) -> None:
+    await session.execute(
+        update(McpServerRow)
+        .where(McpServerRow.status == "running")
+        .values(status="stopped", last_error=None)
+    )
     existing_usernames = set(
         await session.scalars(select(User.username).where(User.username.in_(DEMO_USERS)))
     )

@@ -44,7 +44,7 @@ ZIP 必须保留单一 Skill 根目录，不能只压缩根目录内的散文件
 
 查看 Skill 类型、版本、状态和静态检查告警。点击“发布”，然后在“经理用户 ID”中分别输入步骤 1 记下的 manager ID，各执行一次授权。
 
-可切换到“MCP Server”，填写：显示名称 `mock-pickup`；命令为准备阶段复制的 `.venv\Scripts\python.exe` 绝对路径；参数为 `mock_pickup_server.py`。登记后点击“测试连接”，展示健康状态与 Tool 列表。
+可切换到“MCP Server”，填写：显示名称 `mock-pickup`；命令为准备阶段复制的 `.venv\Scripts\python.exe` 绝对路径；参数为 `mock_pickup_server.py`。登记后点击“测试连接”，展示健康状态与 Tool 列表；演示结束可点击“停止”显式关闭该 Server，页面状态随即回到 `stopped`。
 
 验收点：发布与授权是两个独立动作；两名 manager 都获得相同基础能力。
 
