@@ -182,6 +182,58 @@ async def test_reception_team_uses_real_templates_and_three_mock_tool_paths(tmp_
 
 
 @_async_test
+async def test_reception_executes_persisted_workers_and_reuses_them(tmp_path):
+    """Every role runs through its real AgentScope worker; reruns stay bounded."""
+    from app.agents.reception import ReceptionTeamRuntime
+
+    engine, sessions, users = await _runtime_db(tmp_path)
+    owner = users["manager0001"].id
+    executed: list[tuple[str, str, str]] = []
+
+    class RecordingExecutor:
+        async def execute(
+            self,
+            *,
+            owner_user_id,
+            worker_agent_id,
+            worker_session_id,
+            agent_type,
+            prompt,
+            tool,
+        ):
+            executed.append((agent_type, worker_agent_id, worker_session_id))
+            return await tool(owner_user_id, prompt)
+
+    runtime = ReceptionTeamRuntime(sessions, subagent_executor=RecordingExecutor())
+    for request_id in ("worker-run-1", "worker-run-2"):
+        events = await _collect(
+            runtime.chat(
+                owner,
+                "reception-session-1",
+                "rerunnable reception",
+                request_id=request_id,
+            )
+        )
+        assert events[-1].type == "hitl_pending"
+
+    storage = SQLiteStorage(sessions)
+    leader = await storage.get_session(owner, "", "reception-session-1")
+    team = await storage.get_team(owner, leader.team_id)
+    assert len(team.data.members) == 3
+    actual = {
+        (member.agent_id, member.session_id) for member in team.data.members
+    }
+    assert len(executed) == 6
+    assert {agent_type for agent_type, _, _ in executed} == {
+        "pickup",
+        "lodging",
+        "dining",
+    }
+    assert {(agent_id, session_id) for _, agent_id, session_id in executed} == actual
+    await engine.dispose()
+
+
+@_async_test
 async def test_both_managers_run_independently_and_sse_encoding_is_stable(tmp_path):
     from app.agents.reception import ReceptionTeamRuntime
     from app.agents.sse import encode_sse

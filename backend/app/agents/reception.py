@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -12,9 +13,11 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentscope.app import SubAgentTemplate
+from agentscope.app._bus_ops import enqueue_run_trigger
 from agentscope.app.message_bus import InMemoryMessageBus, MessageBus
+from agentscope.app.message_bus import MessageBusKeys
 from agentscope.app.storage import StorageBase
-from agentscope.message import ToolResultState
+from agentscope.message import HintBlock, ToolResultState
 from agentscope.tool import ToolChunk
 
 from app.db.models import HitlRequestRow, Role, SessionRecordRow, TeamNodeRunRow, TeamRunRow, User
@@ -27,6 +30,49 @@ AgentTool = Callable[[str, str], Awaitable[dict[str, Any]]]
 GovernedToolProvider = Callable[
     [str, str, str, str], Awaitable[dict[str, AgentTool]]
 ]
+
+
+class AgentScopeSubagentExecutor:
+    """Dispatch a persisted worker through AgentScope's inbox/wakeup path.
+
+    The expert business result remains deterministic: after scheduling the
+    actual AgentScope worker session, the role's governed mock tool produces
+    the structured value consumed by this Phase-1 orchestration.
+    """
+
+    def __init__(self, message_bus: MessageBus) -> None:
+        self._message_bus = message_bus
+
+    async def execute(
+        self,
+        *,
+        owner_user_id: str,
+        worker_agent_id: str,
+        worker_session_id: str,
+        agent_type: str,
+        prompt: str,
+        tool: AgentTool,
+    ) -> dict[str, Any]:
+        hint = HintBlock(
+            hint=f'<team-message role="{agent_type}">\n{prompt}\n</team-message>',
+            source=json.dumps(
+                {"label": "reception_subagent", "sublabel": agent_type},
+                ensure_ascii=False,
+            ),
+        )
+        await self._message_bus.queue_push(
+            MessageBusKeys.inbox(worker_session_id),
+            hint.model_dump(mode="json"),
+        )
+        await enqueue_run_trigger(
+            self._message_bus,
+            user_id=owner_user_id,
+            session_id=worker_session_id,
+            agent_id=worker_agent_id,
+        )
+        return await tool(owner_user_id, prompt)
+
+
 logger = logging.getLogger(__name__)
 _AGENT_TYPES = ("pickup", "lodging", "dining")
 _TOOL_PATHS = {
@@ -109,10 +155,13 @@ async def _await_uncancellable(awaitable) -> None:
 class ReceptionTeamRuntime:
     """Deterministic Phase-1 orchestration over real AgentScope templates."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, pickup_tool: AgentTool | None = None, lodging_tool: AgentTool | None = None, dining_skill: AgentTool | None = None, governed_tool_provider: GovernedToolProvider | None = None, templates: list[SubAgentTemplate] | None = None, storage: StorageBase | None = None, message_bus: MessageBus | None = None, workspace_manager: Any = None, after_hitl_commit: Callable[[], Awaitable[None]] | None = None, before_cancel_finalize: Callable[[], Awaitable[None]] | None = None, before_setup_failure_finalize: Callable[[], Awaitable[None]] | None = None, team_create_factory: Callable[..., Any] = TeamCreate, agent_create_factory: Callable[..., Any] = AgentCreate) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, pickup_tool: AgentTool | None = None, lodging_tool: AgentTool | None = None, dining_skill: AgentTool | None = None, governed_tool_provider: GovernedToolProvider | None = None, templates: list[SubAgentTemplate] | None = None, storage: StorageBase | None = None, message_bus: MessageBus | None = None, workspace_manager: Any = None, subagent_executor: Any = None, after_hitl_commit: Callable[[], Awaitable[None]] | None = None, before_cancel_finalize: Callable[[], Awaitable[None]] | None = None, before_setup_failure_finalize: Callable[[], Awaitable[None]] | None = None, team_create_factory: Callable[..., Any] = TeamCreate, agent_create_factory: Callable[..., Any] = AgentCreate) -> None:
         self._sessions = session_factory
         self._storage = storage or SQLiteStorage(session_factory)
         self._message_bus = message_bus or InMemoryMessageBus()
+        self._subagent_executor = subagent_executor or AgentScopeSubagentExecutor(
+            self._message_bus
+        )
         self._workspace_manager = workspace_manager or object()
         self._after_hitl_commit = after_hitl_commit
         self._before_cancel_finalize = before_cancel_finalize
@@ -183,10 +232,21 @@ class ReceptionTeamRuntime:
             sub_agent_templates=template_registry,
         )
         before = await self._storage.get_team(owner, leader.team_id)
-        before_ids = {member.agent_id for member in before.data.members} if before else set()
+        existing: dict[str, Any] = {}
+        if before is not None:
+            for member in before.data.members:
+                record = await self._storage.get_agent(owner, member.agent_id)
+                if record is None:
+                    continue
+                for agent_type in _AGENT_TYPES:
+                    if record.data.name.startswith(f"{agent_type}-"):
+                        existing.setdefault(agent_type, member)
+                        break
         for agent_type in _AGENT_TYPES:
+            if agent_type in existing:
+                continue
             agent_result = await creator(
-                name=f"{agent_type}-{run_id[:8]}",
+                name=f"{agent_type}-worker",
                 description=f"{agent_type} reception specialist",
                 prompt=prompt,
                 subagent_type=agent_type,
@@ -195,13 +255,18 @@ class ReceptionTeamRuntime:
         team = await self._storage.get_team(owner, leader.team_id)
         if team is None:
             raise RuntimeError("AgentScope team disappeared during worker creation")
-        worker_ids = [
-            member.agent_id
-            for member in team.data.members
-            if member.agent_id not in before_ids
-        ]
-        if len(worker_ids) != len(_AGENT_TYPES):
+        workers: dict[str, Any] = {}
+        for member in team.data.members:
+            record = await self._storage.get_agent(owner, member.agent_id)
+            if record is None:
+                continue
+            for agent_type in _AGENT_TYPES:
+                if record.data.name.startswith(f"{agent_type}-"):
+                    workers.setdefault(agent_type, member)
+                    break
+        if set(workers) != set(_AGENT_TYPES):
             raise RuntimeError("AgentScope AgentCreate did not persist all workers")
+        worker_ids = [workers[agent_type].agent_id for agent_type in _AGENT_TYPES]
         async with self._sessions() as db:
             await db.execute(
                 update(SessionRecordRow)
@@ -212,7 +277,17 @@ class ReceptionTeamRuntime:
                 .values(is_internal=True)
             )
             await db.commit()
-        return {"team_id": team.id, "worker_ids": worker_ids}
+        return {
+            "team_id": team.id,
+            "worker_ids": worker_ids,
+            "workers": {
+                agent_type: {
+                    "agent_id": workers[agent_type].agent_id,
+                    "session_id": workers[agent_type].session_id,
+                }
+                for agent_type in _AGENT_TYPES
+            },
+        }
 
     async def _persist_results(self, owner: str, run_id: str, results: dict[str, dict[str, Any] | BaseException]) -> bool:
         now = datetime.now(timezone.utc)
@@ -367,7 +442,20 @@ class ReceptionTeamRuntime:
                         owner_user_id, session_id, prompt, request_id
                     )
                 )
-            raw_results = await asyncio.gather(*(tools[k](owner_user_id, prompt) for k in _AGENT_TYPES), return_exceptions=True)
+            raw_results = await asyncio.gather(
+                *(
+                    self._subagent_executor.execute(
+                        owner_user_id=owner_user_id,
+                        worker_agent_id=agentscope_team["workers"][k]["agent_id"],
+                        worker_session_id=agentscope_team["workers"][k]["session_id"],
+                        agent_type=k,
+                        prompt=prompt,
+                        tool=tools[k],
+                    )
+                    for k in _AGENT_TYPES
+                ),
+                return_exceptions=True,
+            )
             results = dict(zip(_AGENT_TYPES, raw_results, strict=True))
             failed = await self._persist_results(owner_user_id, run_id, results)
             for agent_type in _AGENT_TYPES:
