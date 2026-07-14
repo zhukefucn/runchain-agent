@@ -12,13 +12,13 @@ from app.db.models import Role
 from app.errors import ApiError
 
 
-def _settings() -> Settings:
+def _settings(jwt_secret: str = "unit-test-jwt-secret-at-least-32-bytes") -> Settings:
     return Settings(
         _env_file=None,
         app_env="test",
         database_url="sqlite+aiosqlite:///:memory:",
         workspace_root="test-workspace",
-        jwt_secret_key=SecretStr("unit-test-jwt-secret-at-least-32-bytes"),
+        jwt_secret_key=SecretStr(jwt_secret),
         model_api_key=SecretStr("unit-test-model-key"),
     )
 
@@ -40,10 +40,10 @@ def test_valid_token_round_trips_only_identity_claims():
 
 def test_forged_token_is_rejected():
     settings = _settings()
-    token = create_access_token(
-        Principal("user-1", Role.MANAGER, "tenant-1"), settings=settings
+    forged = create_access_token(
+        Principal("user-1", Role.MANAGER, "tenant-1"),
+        settings=_settings("different-signing-key-at-least-32-bytes"),
     )
-    forged = f"{token[:-1]}{'a' if token[-1] != 'a' else 'b'}"
 
     with pytest.raises(ApiError) as exc_info:
         decode_access_token(forged, settings=settings)
@@ -67,11 +67,22 @@ def test_expired_token_is_rejected():
     assert exc_info.value.code == "TOKEN_EXPIRED"
 
 
-def test_require_role_allows_an_allowed_principal():
+@pytest.mark.parametrize(
+    ("role", "allowed"),
+    [
+        (Role.MANAGER, (Role.MANAGER,)),
+        (Role.BUSINESS_ADMIN, (Role.BUSINESS_ADMIN,)),
+        (
+            Role.BUSINESS_ADMIN,
+            (Role.MANAGER, Role.BUSINESS_ADMIN, Role.SYSTEM_ADMIN),
+        ),
+    ],
+)
+def test_require_role_allows_an_allowed_principal(role, allowed):
     from app.auth.deps import require_role
 
-    principal = Principal("admin-1", Role.SYSTEM_ADMIN, "tenant-1")
-    dependency = require_role(Role.SYSTEM_ADMIN)
+    principal = Principal("user-1", role, "tenant-1")
+    dependency = require_role(*allowed)
 
     assert asyncio.run(dependency(principal)) == principal
 

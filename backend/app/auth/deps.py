@@ -12,7 +12,7 @@ from app.db.session import async_session_factory
 from app.errors import ApiError
 
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -21,10 +21,12 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 async def get_principal(
-    token: str = Depends(oauth2_scheme),
+    token: str | None = Depends(oauth2_scheme),
     session: AsyncSession = Depends(get_session),
     settings: Settings = Depends(get_settings),
 ) -> Principal:
+    if not token:
+        raise ApiError(401, "INVALID_TOKEN", "登录凭证无效")
     principal = decode_access_token(token, settings=settings)
     user = await session.get(User, principal.user_id)
     if user is None or user.role != principal.role:
