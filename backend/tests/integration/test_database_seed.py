@@ -14,6 +14,7 @@ from app.db.models import (
     AuditRecordRow,
     HitlRequestRow,
     McpServerRow,
+    McpAuthorizationRow,
     MessageRow,
     SessionRecordRow,
     SkillAuthorizationRow,
@@ -32,6 +33,7 @@ EXPECTED_TABLES = {
     "audit_records",
     "hitl_requests",
     "mcp_servers",
+    "mcp_tool_authorizations",
     "messages",
     "sessions",
     "skill_authorizations",
@@ -80,6 +82,11 @@ def test_schema_has_required_tables_foreign_keys_owner_indexes_and_unique_auth(t
             isinstance(constraint, UniqueConstraint)
             and {column.name for column in constraint.columns} == {"skill_id", "user_id"}
             for constraint in SkillAuthorizationRow.__table__.constraints
+        )
+        assert any(
+            isinstance(constraint, UniqueConstraint)
+            and {column.name for column in constraint.columns} == {"server_id", "user_id"}
+            for constraint in McpAuthorizationRow.__table__.constraints
         )
         assert not SkillRow.__table__.c.name.unique
         assert any(

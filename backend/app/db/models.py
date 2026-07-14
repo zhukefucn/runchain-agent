@@ -177,14 +177,36 @@ class SkillAuthorizationRow(Base):
 
 class McpServerRow(Base):
     __tablename__ = "mcp_servers"
+    __table_args__ = (UniqueConstraint("name"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    owner_user_id: Mapped[str] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    created_by_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), index=True
     )
     name: Mapped[str] = mapped_column(String(100))
     transport: Mapped[str] = mapped_column(String(32), default="stdio")
     configuration: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    executable_sha256: Mapped[str] = mapped_column(String(64))
+    script_sha256: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), default="stopped", index=True)
+    last_error: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class McpAuthorizationRow(Base):
+    __tablename__ = "mcp_tool_authorizations"
+    __table_args__ = (UniqueConstraint("server_id", "user_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    server_id: Mapped[str] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    granted_by_user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

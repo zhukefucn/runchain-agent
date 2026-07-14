@@ -76,3 +76,10 @@ def test_skill_manifest_schema_validator_is_exactly_pinned():
     lock_lines = (PROJECT_ROOT / "requirements.lock").read_text().splitlines()
     assert '"jsonschema==4.26.0"' in pyproject
     assert "jsonschema==4.26.0" in lock_lines
+
+
+def test_mcp_sdk_is_a_direct_exact_runtime_dependency():
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text()
+    lock_lines = (PROJECT_ROOT / "requirements.lock").read_text().splitlines()
+    assert '"mcp==1.28.1"' in pyproject
+    assert "mcp==1.28.1" in lock_lines
