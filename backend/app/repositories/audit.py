@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
+from math import isfinite
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +28,25 @@ _SENSITIVE_VALUE = re.compile(
     r"(?i)(?:\b(?:authorization|api[_-]?key|password|secret|token)\b\s*[:=]"
     r"|\bbearer\s+[a-z0-9._~+/-]+)"
 )
+_SAFE_ENUM_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$")
+
+# Fail-closed audit metadata schema. Add a field here only after establishing
+# that it cannot contain manager business content or credentials.
+_ALLOWED_SCALAR_FIELDS: dict[str, tuple[type, ...]] = {
+    "count": (int,),
+    "duration_ms": (int, float),
+    "enabled": (bool,),
+    "error_code": (str,),
+    "operation": (str,),
+    "reason_code": (str,),
+    "retryable": (bool,),
+    "role": (str,),
+    "status": (str,),
+    "status_code": (int, str),
+    "transport": (str,),
+}
+_ALLOWED_MAPPING_FIELDS = {"metrics"}
+_ALLOWED_SEQUENCE_FIELDS = {"operations"}
 
 
 def _key_tokens(key: object) -> set[str]:
@@ -38,22 +59,55 @@ def _is_sensitive_key(key: object) -> bool:
     return bool(tokens & _SENSITIVE_TOKENS) or "apikey" in "".join(tokens)
 
 
-def sanitize_audit_details(value: Any) -> Any:
-    """Recursively redact secret or business-content fields before persistence."""
-    if isinstance(value, dict):
-        return {
-            str(key): _REDACTED if _is_sensitive_key(key) else sanitize_audit_details(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [sanitize_audit_details(item) for item in value]
-    if isinstance(value, (bytes, bytearray, memoryview)):
+def _sanitize_scalar(key: str, value: Any) -> Any:
+    allowed_types = _ALLOWED_SCALAR_FIELDS[key]
+    if type(value) not in allowed_types:
         return _REDACTED
     if isinstance(value, str):
-        return _REDACTED if _SENSITIVE_VALUE.search(value) else value
-    if value is None or isinstance(value, (int, float, bool)):
-        return value
-    return str(value)
+        if _SENSITIVE_VALUE.search(value) or not _SAFE_ENUM_VALUE.fullmatch(value):
+            return _REDACTED
+    if isinstance(value, float) and not isfinite(value):
+        return _REDACTED
+    return value
+
+
+def _sanitize_mapping(value: Any) -> dict[str, Any] | str:
+    if not isinstance(value, Mapping):
+        return _REDACTED
+    if any(not isinstance(key, str) for key in value):
+        return _REDACTED
+    return {key: _sanitize_field(key, item) for key, item in value.items()}
+
+
+def _sanitize_sequence(value: Any) -> list[Any] | str:
+    if (
+        isinstance(value, (str, bytes, bytearray, memoryview, set, frozenset))
+        or not isinstance(value, Sequence)
+        or len(value) > 50
+    ):
+        return _REDACTED
+    return [
+        _sanitize_mapping(item) if isinstance(item, Mapping) else _REDACTED
+        for item in value
+    ]
+
+
+def _sanitize_field(key: str, value: Any) -> Any:
+    if _is_sensitive_key(key):
+        return _REDACTED
+    if key in _ALLOWED_SCALAR_FIELDS:
+        return _sanitize_scalar(key, value)
+    if key in _ALLOWED_MAPPING_FIELDS:
+        return _sanitize_mapping(value)
+    if key in _ALLOWED_SEQUENCE_FIELDS:
+        return _sanitize_sequence(value)
+    return _REDACTED
+
+
+def sanitize_audit_details(value: Any) -> dict[str, Any]:
+    """Keep only allowlisted, low-risk metadata; redact every unknown field."""
+    sanitized = _sanitize_mapping(value)
+    return sanitized if isinstance(sanitized, dict) else {}
 
 
 class AuditRepository:
